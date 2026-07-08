@@ -1,0 +1,30 @@
+# CCS/TI编译输出
+Debug/
+Release/
+*.obj
+*.out
+*.map
+*.pp
+*.asm
+*.lst
+
+# 临时文件
+*.tmp
+*.bak
+*~
+.settings/
+.launches/
+
+# IDE配置
+.ccsproject
+.cproject
+.project
+targetConfigs/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# 大型二进制文件（如果有）
+*.bin
+*.hex

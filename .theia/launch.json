@@ -1,0 +1,58 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "DSP_LAB_Trea_CCS20",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "DSP_LAB_Trea_CCS20",
+                "resourceId": "/DSP_LAB_Trea_CCS20"
+            },
+            "connections": [
+                {
+                    "name": "Texas Instruments XDS100v3 USB Debug Probe",
+                    "cores": [
+                        {
+                            "name": "C674X_0",
+                            "debuggerSettings": {
+                                "data": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?>\n<PropertyValues/>\n"
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "DSP_LAB_0507",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "DSP_LAB_0507",
+                "resourceId": "/DSP_LAB_0507"
+            }
+        },
+        {
+            "name": "DSP_LAB_0507 (1)",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "DSP_LAB_0507",
+                "resourceId": "/DSP_LAB_0507/__ccs_2_generatedBinaries"
+            },
+            "connections": [
+                {
+                    "name": "Texas Instruments XDS100v3 USB Debug Probe",
+                    "cores": [
+                        {
+                            "name": "C674X_0",
+                            "debuggerSettings": {
+                                "data": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?>\n<PropertyValues/>\n"
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
