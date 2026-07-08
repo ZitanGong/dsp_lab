@@ -4,6 +4,8 @@
 #include "driver_include.h"
 #include "user_include.h"
 #include "weights.h"
+#include "raster.h"
+#include "soc_C6748.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -27,6 +29,7 @@
 
 // LCD刷新控制
 #define P3_REFRESH_INTERVAL     25  // 每25帧刷新一次（约500ms）
+#define P3_LCD_BUFFER_BYTES     (P3_LCD_W * P3_LCD_H * 2 + 32)
 
 #define PROJECT3_PI                         3.14159265358979323846f
 
@@ -141,6 +144,7 @@ typedef struct {
 
 // LCD防重入标志
 static volatile int s_lcd_busy = 0;
+static volatile int s_lcd_suspended = 0;
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx);
 static void Project3_InitUi(PROJECT3_CONTEXT *ctx);
@@ -222,11 +226,10 @@ static float g_project3_tw_im[PROJECT3_FFT_LEN / 2];
 
 static unsigned char g_project3_tables_ready = 0;
 
+extern unsigned char Lcd_Buffer[];
+
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state);
 static void Project3_SetUiText(PROJECT3_CONTEXT *ctx, const char *main_text, const char *line1, const char *line2);
-static void Project3_ClearCenterArea(void);
-static void Project3_DrawCenterText(const char *text, unsigned long color);
-static void Project3_UpdateBottomStatusBar(PROJECT3_CONTEXT *ctx);
 static void Project3_InitTables(void);
 static void Project3_Fft512(float *re, float *im);
 static float Project3_PaddedModelSample(int idx);
@@ -242,6 +245,8 @@ static void Project3_WriteOutputBlockToDac(const short *src);
 static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx);
 static void Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw);
 static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx);
+static void Project3_LcdSuspend(void);
+static void Project3_LcdResume(void);
 
 static void Project3_Conv2d(const float *in, float *out,
                             int in_c, int in_h, int in_w,
@@ -277,57 +282,77 @@ static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const 
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state)
 {
-    if (ctx->app_state != state) {
-        ctx->app_state = state;
-        ctx->redraw_needed = 1;
-    }
+    ctx->app_state = state;
 }
 
 static void Project3_SetUiText(PROJECT3_CONTEXT *ctx, const char *main_text, const char *line1, const char *line2)
 {
-    if (main_text != NULL) {
+    unsigned char changed = 0;
+
+    if (main_text != NULL && strncmp(ctx->main_text, main_text, PROJECT3_RESULT_TEXT_LEN) != 0) {
         strncpy(ctx->main_text, main_text, PROJECT3_RESULT_TEXT_LEN - 1);
         ctx->main_text[PROJECT3_RESULT_TEXT_LEN - 1] = '\0';
+        changed = 1;
     }
-    if (line1 != NULL) {
+    if (line1 != NULL && strncmp(ctx->line1, line1, PROJECT3_UI_TEXT_LEN) != 0) {
         strncpy(ctx->line1, line1, PROJECT3_UI_TEXT_LEN - 1);
         ctx->line1[PROJECT3_UI_TEXT_LEN - 1] = '\0';
+        changed = 1;
     }
-    if (line2 != NULL) {
+    if (line2 != NULL && strncmp(ctx->line2, line2, PROJECT3_UI_TEXT_LEN) != 0) {
         strncpy(ctx->line2, line2, PROJECT3_UI_TEXT_LEN - 1);
         ctx->line2[PROJECT3_UI_TEXT_LEN - 1] = '\0';
+        changed = 1;
     }
-    ctx->redraw_needed = 1;
+    if (changed) {
+        ctx->redraw_needed = 1;
+    }
+}
+
+static void Project3_LcdSuspend(void)
+{
+    if (!s_lcd_suspended) {
+        RasterDisable(SOC_LCDC_0_REGS);
+        s_lcd_suspended = 1;
+    }
+}
+
+static void Project3_LcdResume(void)
+{
+    if (s_lcd_suspended) {
+        CacheWB((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
+        RasterEnable(SOC_LCDC_0_REGS);
+        s_lcd_suspended = 0;
+    }
 }
 
 static void Project3_ClearAndDrawText(const char *text, unsigned long color)
 {
     tRectangle rect;
+    volatile unsigned int wait;
 
-    // 使用固定布局宏
     rect.sXMin = P3_CLAMP_X(P3_TEXT_AREA_X);
     rect.sYMin = P3_CLAMP_Y(P3_TEXT_AREA_Y);
     rect.sXMax = P3_CLAMP_X(P3_TEXT_AREA_X + P3_TEXT_AREA_W - 1);
     rect.sYMax = P3_CLAMP_Y(P3_TEXT_AREA_Y + P3_TEXT_AREA_H - 1);
 
-    // 第1步：清空区域为纯黑
+    for (wait = 0; wait < 20000; wait++) {
+        if (RasterClearGetIntStatus(SOC_LCDC_0_REGS, RASTER_END_OF_FRAME0_INT_STAT)) {
+            break;
+        }
+    }
+
+    Project3_LcdSuspend();
+
     GrContextForegroundSet(&Lcd_Context, ClrBlack);
     GrRectFill(&Lcd_Context, &rect);
 
-    // 第2步：立即在同一区域绘制文字（不设置裁剪区域，避免状态切换）
     GrContextForegroundSet(&Lcd_Context, color);
     GrContextBackgroundSet(&Lcd_Context, ClrBlack);
     GrContextFontSet(&Lcd_Context, &g_sFontCm48);
     GrStringDraw(&Lcd_Context, text, -1, P3_TEXT_X, P3_TEXT_Y, 1);
-}
 
-static void Project3_UpdateBottomStatusBar(PROJECT3_CONTEXT *ctx)
-{
-    CanvasTextSet(&g_sTxt1, ctx->line1);
-    CanvasTextSet(&g_sTxt2, ctx->line2);
-    WidgetPaint((tWidget *)&g_sTxt1);
-    WidgetPaint((tWidget *)&g_sTxt2);
-    WidgetMessageQueueProcess();
+    Project3_LcdResume();
 }
 
 static void Project3_InitTables(void)
@@ -841,7 +866,9 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
 static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const PROJECT3_UTTERANCE_BUFFER *utter)
 {
     if (!result->valid) {
-        result->class_id = PROJECT3_CLASS_UNKNOWN;
+        if (result->class_id != PROJECT3_CLASS_SILENCE) {
+            result->class_id = PROJECT3_CLASS_UNKNOWN;
+        }
         return 0;
     }
 
@@ -870,16 +897,12 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     if (result.class_id == PROJECT3_CLASS_SILENCE) {
         ctx->input_gate_blocks = PROJECT3_POST_INFER_IGNORE_BLOCKS;
         Project3_ResetUtterance(ctx);
-        // 强制标记 last_main_text 为空，确保下次一定重绘
-        ctx->last_main_text[0] = '\0';
         Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
         Project3_SetUiText(ctx, "I am listening...", "", "");
         return;
     }
 
     label = Project3_GetLabel(result.class_id);
-    // 强制标记 last_main_text 为空，确保一定重绘新结果
-    ctx->last_main_text[0] = '\0';
     Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
     Project3_SetUiText(ctx, label, "", "");
     ctx->recognized_count++;
@@ -947,6 +970,7 @@ static void Project3_InitUi(PROJECT3_CONTEXT *ctx)
 
     // 防重入标志初始化
     s_lcd_busy = 0;
+    s_lcd_suspended = 0;
 
     // 全屏清屏一次（只在初始化时）- 使用固定布局宏
     fullscreen.sXMin = 0;
@@ -955,6 +979,7 @@ static void Project3_InitUi(PROJECT3_CONTEXT *ctx)
     fullscreen.sYMax = P3_LCD_H - 1;
     GrContextForegroundSet(&Lcd_Context, ClrBlack);
     GrRectFill(&Lcd_Context, &fullscreen);
+    CacheWB((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
 
     // 初始化 last_main_text 为空，确保第一次一定绘制
     ctx->last_main_text[0] = '\0';
@@ -1004,36 +1029,16 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
 
 static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx)
 {
-    if (FLAG_TOUCH) {
-        FLAG_TOUCH = 0;
-        Touch_Scan();
-    }
-
-    // 触摸屏功能已禁用，所有控制通过物理按键
-    if (FLAG_BUTTON_1) {
-        FLAG_BUTTON_1 = 0;
-    }
-    if (FLAG_BUTTON_2) {
-        FLAG_BUTTON_2 = 0;
-    }
-    if (FLAG_BUTTON_3) {
-        FLAG_BUTTON_3 = 0;
-    }
-    if (FLAG_BUTTON_4) {
-        FLAG_BUTTON_4 = 0;
-    }
-    if (FLAG_BUTTON_5) {
-        FLAG_BUTTON_5 = 0;
-    }
-    if (FLAG_BUTTON_6) {
-        FLAG_BUTTON_6 = 0;
-    }
-    if (FLAG_BUTTON_7) {
-        FLAG_BUTTON_7 = 0;
-    }
-    if (FLAG_BUTTON_8) {
-        FLAG_BUTTON_8 = 0;
-    }
+    (void)ctx;
+    FLAG_TOUCH = 0;
+    FLAG_BUTTON_1 = 0;
+    FLAG_BUTTON_2 = 0;
+    FLAG_BUTTON_3 = 0;
+    FLAG_BUTTON_4 = 0;
+    FLAG_BUTTON_5 = 0;
+    FLAG_BUTTON_6 = 0;
+    FLAG_BUTTON_7 = 0;
+    FLAG_BUTTON_8 = 0;
 }
 
 static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsigned int block_samples)
@@ -1125,8 +1130,6 @@ static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx)
     if (ctx->ui_hold_blocks > 0) {
         ctx->ui_hold_blocks--;
         if (ctx->ui_hold_blocks == 0) {
-            // 强制标记 last_main_text 为空，确保下次一定重绘
-            ctx->last_main_text[0] = '\0';
             Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
             Project3_SetUiText(ctx, "I am listening...", "", "");
         }
@@ -1136,7 +1139,7 @@ static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx)
 static void Project3_UpdateUi(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
 {
     if (force_redraw || ctx->redraw_needed) {
-        Project3_RenderScreen(ctx, 1);
+        Project3_RenderScreen(ctx, force_redraw);
         ctx->redraw_needed = 0;
     }
 }

@@ -27,11 +27,6 @@ int main(void)
     Dac_Start();
 
     while (1) {
-        // LCD刷新独立于音频处理，在主循环空闲时执行
-        if (ctx.redraw_needed && !s_lcd_busy && FLAG_AD == 0) {
-            Project3_UpdateUi(&ctx, 0);
-        }
-
         Project3_HandleKeys(&ctx);
         Project3_HandleTouch(&ctx);
 
@@ -42,6 +37,10 @@ int main(void)
             Project3_FillDacOutput(&ctx, g_project3_input_block);
             Project3_WriteOutputBlockToDac(g_project3_output_block);
             FLAG_DA = 0;
+        }
+
+        if (ctx.redraw_needed && !s_lcd_busy) {
+            Project3_UpdateUi(&ctx, 0);
         }
     }
 }
