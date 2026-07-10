@@ -1791,6 +1791,7 @@ static void Project3_UpdateUi(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
         if (Project3_RenderScreen(ctx, force_redraw)) {
             ctx->redraw_needed = 0;
             ctx->lcd_retry_frame = 0u;
+            ctx->lcd_last_redraw_frame = ctx->frame_counter;
         } else {
             ctx->lcd_retry_frame = ctx->frame_counter + 4u;
         }
