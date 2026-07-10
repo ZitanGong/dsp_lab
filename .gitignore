@@ -1,6 +1,8 @@
 # CCS/TI编译输出
 Debug/
 Release/
+!Library/StarterWare/*/Debug/
+!Library/StarterWare/*/Debug/*.lib
 *.obj
 *.out
 *.map
