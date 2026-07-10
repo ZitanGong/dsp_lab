@@ -42,12 +42,25 @@
 
 
 extern unsigned char Lcd_Buffer[];
+extern unsigned char Lcd_BackBuffer[];
+extern volatile unsigned long lcd_eof0_count;
+extern volatile unsigned long lcd_eof1_count;
+extern volatile unsigned long lcd_fifo_underflow_count;
+extern volatile unsigned long lcd_sync_lost_count;
+extern volatile unsigned long lcd_recovery_count;
 
 unsigned char Lcd_WaitForEndOfFrame(void);
 unsigned int Lcd_GetRasterFaultStatus(void);
 unsigned char *Lcd_GetDrawBuffer(void);
 unsigned char Lcd_SwapFrameBuffers(void);
 void Lcd_RecoverRasterDma(void);
+void Lcd_ServiceRasterHealth(void);
+unsigned char Lcd_UpdateRegionToBothBuffers(const unsigned char *src,
+                                            unsigned int x,
+                                            unsigned int y,
+                                            unsigned int width,
+                                            unsigned int height,
+                                            unsigned int src_row_bytes);
 
 
 /**

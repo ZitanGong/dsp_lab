@@ -72,5 +72,6 @@ SECTIONS
     .c6xabi.extab  >  DDR2
 
     /* new sections */
+    project3_l2_data > DSPL2RAM
     offscreen_buffer > LCD_FB
-}
+  }

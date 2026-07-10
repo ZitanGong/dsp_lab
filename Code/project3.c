@@ -42,5 +42,7 @@ int main(void)
         if (ctx.redraw_needed && !s_lcd_busy) {
             Project3_UpdateUi(&ctx, 0);
         }
+
+        Lcd_ServiceRasterHealth();
     }
 }
