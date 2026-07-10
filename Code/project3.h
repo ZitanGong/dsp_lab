@@ -1321,8 +1321,10 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
 
     if (best == PROJECT3_CLASS_SILENCE || best == PROJECT3_CLASS_UNKNOWN) {
         result.valid = 0;
-    } else if (best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
-               result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) {
+    } else if ((best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
+                result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) &&
+               (best_prob < PROJECT3_INFERENCE_SOFT_CONF ||
+                result.margin < PROJECT3_INFERENCE_SOFT_MARGIN)) {
         result.valid = 0;
     }
 
