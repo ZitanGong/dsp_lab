@@ -24,7 +24,7 @@ void Lcd_Init(void)
     Lcd_CTRL_Init();
     Lcd_Raster_Init();
     Lcd_DMA_Init();
-    Lcd_Raster_Enable();
     Lcd_Grlib_Init();
+    Lcd_Raster_Enable();
     // Lcd_Widget_Init();
 }

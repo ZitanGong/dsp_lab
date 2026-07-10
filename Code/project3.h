@@ -6,6 +6,8 @@
 #include "weights.h"
 #include "raster.h"
 #include "soc_C6748.h"
+#include "lcd_dma.h"
+#include "lcd_grlib.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -20,16 +22,31 @@
 #define P3_TEXT_AREA_Y          180
 #define P3_TEXT_AREA_W          600
 #define P3_TEXT_AREA_H          120
-#define P3_TEXT_X               200  // 文字绘制起点X（绝对坐标）
-#define P3_TEXT_Y               215  // 文字绘制起点Y（绝对坐标）
+#define P3_TEXT_X               200
+#define P3_TEXT_Y               215
 
 // 坐标裁剪宏
 #define P3_CLAMP_X(x)           (((x) < 0) ? 0 : (((x) >= P3_LCD_W) ? (P3_LCD_W - 1) : (x)))
 #define P3_CLAMP_Y(y)           (((y) < 0) ? 0 : (((y) >= P3_LCD_H) ? (P3_LCD_H - 1) : (y)))
 
 // LCD刷新控制
-#define P3_REFRESH_INTERVAL     25  // 每25帧刷新一次（约500ms）
-#define P3_LCD_BUFFER_BYTES     (P3_LCD_W * P3_LCD_H * 2 + 32)
+#define P3_LCD_BUFFER_BYTES     (4 + 32 + P3_LCD_W * P3_LCD_H * 2)
+#define P3_LCD_PIXEL_OFFSET     (4 + 32)
+#define P3_CACHE_LINE_BYTES     128u
+#define P3_TEXT_BAND_X          P3_TEXT_AREA_X
+#define P3_TEXT_BAND_Y          P3_TEXT_AREA_Y
+#define P3_TEXT_BAND_W          P3_TEXT_AREA_W
+#define P3_TEXT_BAND_H          P3_TEXT_AREA_H
+#define P3_TEXT_BUFFER_BYTES    (4 + 32 + P3_TEXT_BAND_W * P3_TEXT_BAND_H * 2)
+#define P3_LISTENING_TEXT       "Listening..."
+#define PROJECT3_LCD_KEEPALIVE_FRAMES      100u
+#define P3_FONT_W               5
+#define P3_FONT_H               7
+#define P3_FONT_GAP             1
+#define P3_RGB565_BLACK         0x0000u
+#define P3_RGB565_WHITE         0xFFFFu
+#define P3_RGB565_IDLE          0xB63Bu
+#define PROJECT3_LCD_PAUSE_DURING_INFERENCE 0
 
 #define PROJECT3_PI                         3.14159265358979323846f
 
@@ -46,6 +63,7 @@
 #define PROJECT3_MODEL_SAMPLES              16000
 #define PROJECT3_VAD_FRAME_LEN              400
 #define PROJECT3_VAD_HOP                    200
+#define PROJECT3_PREROLL_SAMPLES            (PROJECT3_HW_SAMPLE_RATE / 20)
 #define PROJECT3_WIN_SIZE                   480
 #define PROJECT3_HOP_SIZE                   160
 #define PROJECT3_FFT_LEN                    512
@@ -57,13 +75,22 @@
 #define PROJECT3_UI_TEXT_LEN                64
 #define PROJECT3_RESULT_TEXT_LEN            32
 #define PROJECT3_PASS_THROUGH_ENABLE        0
-#define PROJECT3_INFERENCE_CONF_THRESHOLD   0.35f
-#define PROJECT3_DOWN_CONF_THRESHOLD        0.65f
+#define PROJECT3_INFERENCE_CONF_THRESHOLD   0.40f
+#define PROJECT3_INFERENCE_MARGIN_THRESHOLD 0.08f
+#define PROJECT3_INFERENCE_SOFT_CONF        0.25f
+#define PROJECT3_INFERENCE_SOFT_MARGIN      0.02f
+#define PROJECT3_WAVE_TARGET_RMS            0.10f
+#define PROJECT3_WAVE_MAX_GAIN              16.0f
+#define PROJECT3_WAVE_PEAK_LIMIT            0.98f
+#define PROJECT3_WAVE_MIN_RMS               1.0e-5f
 #define PROJECT3_DOWN_MAX_SAMPLES           (PROJECT3_HW_SAMPLE_RATE * 6 / 10)
 #define PROJECT3_MIN_UTTERANCE_SAMPLES      (PROJECT3_HW_SAMPLE_RATE / 5)
 #define PROJECT3_POST_INFER_IGNORE_BLOCKS   8
-#define PROJECT3_RESULT_HOLD_BLOCKS         100
-#define PROJECT3_REJECT_HOLD_BLOCKS         50
+#define PROJECT3_MESSAGE_HOLD_BLOCKS        20
+#define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE * 3 / PROJECT3_BLOCK_SAMPLES) + 1)
+#define PROJECT3_ERROR_HOLD_BLOCKS          50
+#define PROJECT3_VAD_CALIB_FRAMES           12
+#define PROJECT3_VAD_MIN_FLOOR              1.0e-8f
 
 #define PROJECT3_CENTER_X                   400
 #define PROJECT3_CENTER_Y                   215
@@ -72,6 +99,9 @@
 
 #define PROJECT3_BN_EPS                     1.0e-5f
 #define PROJECT3_ACT_MAX                    (16 * 20 * PROJECT3_MODEL_FRAMES)
+#define PROJECT3_GUARD_WORDS                64
+#define PROJECT3_GUARD_BASE                 0x5A17C0DEu
+#define PROJECT3_GUARD_STEP                 0x00100193u
 
 typedef enum {
     PROJECT3_APP_BOOT = 0,
@@ -106,6 +136,7 @@ typedef struct {
     float smooth_energy;
     unsigned short speech_hold_frames;
     unsigned short silence_hold_frames;
+    unsigned short calibrate_frames;
     unsigned char active;
 } PROJECT3_VAD_STATE;
 
@@ -117,9 +148,17 @@ typedef struct {
 
 typedef struct {
     unsigned char class_id;
+    unsigned char second_class_id;
     float confidence;
+    float second_confidence;
+    float margin;
     unsigned char valid;
 } PROJECT3_INFER_RESULT;
+
+typedef struct {
+    float logits[PROJECT3_CMD_COUNT];
+    volatile unsigned int guard[PROJECT3_GUARD_WORDS];
+} PROJECT3_LOGITS_STORAGE;
 
 typedef struct {
     PROJECT3_APP_STATE app_state;
@@ -135,16 +174,20 @@ typedef struct {
     char last_line2[PROJECT3_UI_TEXT_LEN];
     unsigned long recognized_count;
     unsigned long frame_counter;
+    unsigned long lcd_retry_frame;
+    unsigned long lcd_fault_count;
+    unsigned long lcd_last_redraw_frame;
     unsigned char pass_through_enable;
     unsigned char input_gate_blocks;
-    unsigned char ui_hold_blocks;
+    unsigned char message_hold_blocks;
+    unsigned char message_return_to_listening;
+    unsigned char error_hold_blocks;
     unsigned char redraw_needed;
-    unsigned char lcd_refresh_counter;  // 低频刷新计数器
 } PROJECT3_CONTEXT;
 
 // LCD防重入标志
 static volatile int s_lcd_busy = 0;
-static volatile int s_lcd_suspended = 0;
+static volatile int s_lcd_infer_paused = 0;
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx);
 static void Project3_InitUi(PROJECT3_CONTEXT *ctx);
@@ -152,10 +195,12 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx);
 static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx);
 static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsigned int block_samples);
 static void Project3_UpdateUi(PROJECT3_CONTEXT *ctx, unsigned char force_redraw);
+static void Project3_ServiceLcdHealth(PROJECT3_CONTEXT *ctx);
 static void Project3_ModelInit(PROJECT3_CONTEXT *ctx);
 static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const PROJECT3_UTTERANCE_BUFFER *utter);
 static const char *Project3_GetLabel(unsigned char class_id);
 static void Project3_ResetUtterance(PROJECT3_CONTEXT *ctx);
+static void Project3_ResetPreroll(void);
 
 #define P3_IDX3(c, h, w, H, W)       ((((c) * (H)) + (h)) * (W) + (w))
 #define P3_W4(o, i, kh, kw, IC, KH, KW) (((((o) * (IC)) + (i)) * (KH) + (kh)) * (KW) + (kw))
@@ -178,6 +223,11 @@ static const char *g_project3_labels[PROJECT3_CMD_COUNT] = {
 
 #pragma DATA_ALIGN(g_project3_input_block, 8)
 static short g_project3_input_block[PROJECT3_BLOCK_SAMPLES];
+
+#pragma DATA_ALIGN(g_project3_preroll, 8)
+static short g_project3_preroll[PROJECT3_PREROLL_SAMPLES];
+static unsigned int g_project3_preroll_pos = 0;
+static unsigned int g_project3_preroll_count = 0;
 
 #pragma DATA_ALIGN(g_project3_output_block, 8)
 static short g_project3_output_block[PROJECT3_BLOCK_SAMPLES];
@@ -215,8 +265,9 @@ static float g_project3_act_c[PROJECT3_ACT_MAX];
 #pragma DATA_ALIGN(g_project3_fc_in, 8)
 static float g_project3_fc_in[32];
 
-#pragma DATA_ALIGN(g_project3_logits, 8)
-static float g_project3_logits[PROJECT3_CMD_COUNT];
+#pragma DATA_ALIGN(g_project3_logits_store, 8)
+static PROJECT3_LOGITS_STORAGE g_project3_logits_store;
+#define g_project3_logits (g_project3_logits_store.logits)
 
 #pragma DATA_ALIGN(g_project3_tw_re, 8)
 static float g_project3_tw_re[PROJECT3_FFT_LEN / 2];
@@ -224,9 +275,63 @@ static float g_project3_tw_re[PROJECT3_FFT_LEN / 2];
 #pragma DATA_ALIGN(g_project3_tw_im, 8)
 static float g_project3_tw_im[PROJECT3_FFT_LEN / 2];
 
+static unsigned short g_project3_mel_first_bin[PROJECT3_MELS_NUM];
+static unsigned short g_project3_mel_last_bin[PROJECT3_MELS_NUM];
 static unsigned char g_project3_tables_ready = 0;
+static volatile unsigned char g_project3_memory_fault = 0;
 
 extern unsigned char Lcd_Buffer[];
+
+#pragma DATA_ALIGN(g_project3_text_buffer, 128)
+static unsigned char g_project3_text_buffer[P3_TEXT_BUFFER_BYTES];
+
+static const unsigned char g_project3_font_digits[10][P3_FONT_H] = {
+    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},
+    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+    {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E},
+    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
+    {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E},
+    {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E},
+    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}
+};
+
+static const unsigned char g_project3_font_letters[26][P3_FONT_H] = {
+    {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+    {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+    {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+    {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+    {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F},
+    {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+    {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
+    {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C},
+    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
+    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+    {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+    {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
+    {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+    {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
+    {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+    {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04},
+    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
+    {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
+    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
+    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}
+};
+
+static const unsigned char g_project3_font_blank[P3_FONT_H] = {0, 0, 0, 0, 0, 0, 0};
+static const unsigned char g_project3_font_dot[P3_FONT_H] = {0, 0, 0, 0, 0, 0x0C, 0x0C};
+static const unsigned char g_project3_font_dash[P3_FONT_H] = {0, 0, 0, 0x1F, 0, 0, 0};
+static const unsigned char g_project3_font_under[P3_FONT_H] = {0, 0, 0, 0, 0, 0, 0x1F};
+static const unsigned char g_project3_font_qmark[P3_FONT_H] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0, 0x04};
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state);
 static void Project3_SetUiText(PROJECT3_CONTEXT *ctx, const char *main_text, const char *line1, const char *line2);
@@ -235,18 +340,26 @@ static void Project3_Fft512(float *re, float *im);
 static float Project3_PaddedModelSample(int idx);
 static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter);
 static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float *out_logmel);
+static void Project3_FormatRawResult(const PROJECT3_INFER_RESULT *result, char *text, unsigned int text_len);
 static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len);
 static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy);
 static unsigned char Project3_ShouldEndUtterance(PROJECT3_CONTEXT *ctx);
 static void Project3_AppendRawBlock(PROJECT3_CONTEXT *ctx, const short *block, unsigned int block_samples);
+static void Project3_UpdatePreroll(const short *block, unsigned int block_samples);
+static void Project3_AppendPreroll(PROJECT3_CONTEXT *ctx);
 static void Project3_CopyInputBlock(short *dst);
 static void Project3_FillDacOutput(const PROJECT3_CONTEXT *ctx, const short *src);
 static void Project3_WriteOutputBlockToDac(const short *src);
 static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx);
-static void Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw);
-static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx);
-static void Project3_LcdSuspend(void);
-static void Project3_LcdResume(void);
+static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw);
+static void Project3_RequestTextRedraw(PROJECT3_CONTEXT *ctx);
+static void Project3_LcdPauseForInference(void);
+static void Project3_LcdResumeAfterInference(void);
+static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx);
+static void Project3_ServiceErrorHold(PROJECT3_CONTEXT *ctx);
+static void Project3_ResetMemoryGuard(void);
+static unsigned char Project3_CheckMemoryGuard(void);
+static PROJECT3_INFER_RESULT Project3_MemoryFaultResult(void);
 
 static void Project3_Conv2d(const float *in, float *out,
                             int in_c, int in_h, int in_w,
@@ -279,6 +392,7 @@ static void Project3_BCResBlock(const float *in, float *out,
 static void Project3_BCResNetForward(const float *logmel, float *logits);
 static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits);
 static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const PROJECT3_UTTERANCE_BUFFER *utter);
+static unsigned char Project3_IsCommandClass(unsigned char class_id);
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state)
 {
@@ -309,50 +423,285 @@ static void Project3_SetUiText(PROJECT3_CONTEXT *ctx, const char *main_text, con
     }
 }
 
-static void Project3_LcdSuspend(void)
+static void Project3_RequestTextRedraw(PROJECT3_CONTEXT *ctx)
 {
-    if (!s_lcd_suspended) {
-        RasterDisable(SOC_LCDC_0_REGS);
-        s_lcd_suspended = 1;
+    ctx->last_main_text[0] = '\0';
+    ctx->redraw_needed = 1;
+    ctx->lcd_retry_frame = 0u;
+}
+
+static void Project3_ServiceLcdHealth(PROJECT3_CONTEXT *ctx)
+{
+    unsigned int lcd_fault = Lcd_GetRasterFaultStatus();
+
+    if (lcd_fault != 0u) {
+        ctx->lcd_fault_count++;
+        Lcd_RecoverRasterDma();
+        Project3_RequestTextRedraw(ctx);
+    } else if ((ctx->frame_counter - ctx->lcd_last_redraw_frame) >= PROJECT3_LCD_KEEPALIVE_FRAMES) {
+        Project3_RequestTextRedraw(ctx);
     }
 }
 
-static void Project3_LcdResume(void)
+static void Project3_ResetMemoryGuard(void)
 {
-    if (s_lcd_suspended) {
-        CacheWB((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
-        RasterEnable(SOC_LCDC_0_REGS);
-        s_lcd_suspended = 0;
+    unsigned int i;
+
+    for (i = 0; i < PROJECT3_GUARD_WORDS; i++) {
+        g_project3_logits_store.guard[i] = PROJECT3_GUARD_BASE ^ (PROJECT3_GUARD_STEP * (i + 1u));
     }
+    g_project3_memory_fault = 0;
 }
 
-static void Project3_ClearAndDrawText(const char *text, unsigned long color)
+static unsigned char Project3_CheckMemoryGuard(void)
 {
-    tRectangle rect;
-    volatile unsigned int wait;
+    unsigned int i;
 
-    rect.sXMin = P3_CLAMP_X(P3_TEXT_AREA_X);
-    rect.sYMin = P3_CLAMP_Y(P3_TEXT_AREA_Y);
-    rect.sXMax = P3_CLAMP_X(P3_TEXT_AREA_X + P3_TEXT_AREA_W - 1);
-    rect.sYMax = P3_CLAMP_Y(P3_TEXT_AREA_Y + P3_TEXT_AREA_H - 1);
-
-    for (wait = 0; wait < 20000; wait++) {
-        if (RasterClearGetIntStatus(SOC_LCDC_0_REGS, RASTER_END_OF_FRAME0_INT_STAT)) {
-            break;
+    for (i = 0; i < PROJECT3_GUARD_WORDS; i++) {
+        if (g_project3_logits_store.guard[i] != (PROJECT3_GUARD_BASE ^ (PROJECT3_GUARD_STEP * (i + 1u)))) {
+            g_project3_memory_fault = 1;
+            return 0;
         }
     }
 
-    Project3_LcdSuspend();
+    return 1;
+}
 
-    GrContextForegroundSet(&Lcd_Context, ClrBlack);
-    GrRectFill(&Lcd_Context, &rect);
+static PROJECT3_INFER_RESULT Project3_MemoryFaultResult(void)
+{
+    PROJECT3_INFER_RESULT result;
 
-    GrContextForegroundSet(&Lcd_Context, color);
-    GrContextBackgroundSet(&Lcd_Context, ClrBlack);
-    GrContextFontSet(&Lcd_Context, &g_sFontCm48);
-    GrStringDraw(&Lcd_Context, text, -1, P3_TEXT_X, P3_TEXT_Y, 1);
+    result.class_id = PROJECT3_CLASS_UNKNOWN;
+    result.second_class_id = PROJECT3_CLASS_UNKNOWN;
+    result.confidence = 0.0f;
+    result.second_confidence = 0.0f;
+    result.margin = 0.0f;
+    result.valid = 0;
+    return result;
+}
 
-    Project3_LcdResume();
+static void Project3_CacheWriteBackAligned(unsigned int base_addr, unsigned int byte_size)
+{
+    unsigned int aligned_base;
+    unsigned int aligned_end;
+
+    if (byte_size == 0u) {
+        return;
+    }
+
+    aligned_base = base_addr & ~(P3_CACHE_LINE_BYTES - 1u);
+    aligned_end = (base_addr + byte_size + P3_CACHE_LINE_BYTES - 1u) &
+                  ~(P3_CACHE_LINE_BYTES - 1u);
+    CacheWB(aligned_base, aligned_end - aligned_base);
+}
+
+static void Project3_LcdPauseForInference(void)
+{
+#if PROJECT3_LCD_PAUSE_DURING_INFERENCE
+    if (!s_lcd_infer_paused) {
+        Project3_CacheWriteBackAligned((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
+        (void)Lcd_WaitForEndOfFrame();
+        RasterDisable(SOC_LCDC_0_REGS);
+        (void)Lcd_GetRasterFaultStatus();
+        s_lcd_infer_paused = 1;
+    }
+#endif
+}
+
+static void Project3_LcdResumeAfterInference(void)
+{
+#if PROJECT3_LCD_PAUSE_DURING_INFERENCE
+    if (s_lcd_infer_paused) {
+        Project3_CacheWriteBackAligned((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
+        RasterEnable(SOC_LCDC_0_REGS);
+        s_lcd_infer_paused = 0;
+        (void)Lcd_GetRasterFaultStatus();
+    }
+#endif
+}
+
+static unsigned short Project3_ColorToRgb565(unsigned long color)
+{
+    unsigned int r = (unsigned int)((color >> 16) & 0xFFu);
+    unsigned int g = (unsigned int)((color >> 8) & 0xFFu);
+    unsigned int b = (unsigned int)(color & 0xFFu);
+
+    return (unsigned short)(((r & 0xF8u) << 8) |
+                            ((g & 0xFCu) << 3) |
+                            (b >> 3));
+}
+
+static const unsigned char *Project3_GetGlyph(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return g_project3_font_digits[ch - '0'];
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        return g_project3_font_letters[ch - 'a'];
+    }
+    if (ch >= 'A' && ch <= 'Z') {
+        return g_project3_font_letters[ch - 'A'];
+    }
+    if (ch == '.') {
+        return g_project3_font_dot;
+    }
+    if (ch == '-') {
+        return g_project3_font_dash;
+    }
+    if (ch == '_') {
+        return g_project3_font_under;
+    }
+    if (ch == ' ') {
+        return g_project3_font_blank;
+    }
+    return g_project3_font_qmark;
+}
+
+static unsigned int Project3_TextWidthPixels(const char *text, unsigned int scale)
+{
+    unsigned int chars = 0u;
+
+    while (text != NULL && text[chars] != '\0' && chars < PROJECT3_RESULT_TEXT_LEN - 1u) {
+        chars++;
+    }
+
+    if (chars == 0u) {
+        return 0u;
+    }
+    return (((P3_FONT_W + P3_FONT_GAP) * chars) - P3_FONT_GAP) * scale;
+}
+
+static void Project3_PutScaledPixel(unsigned short *pixels,
+                                    int x, int y,
+                                    unsigned int scale,
+                                    unsigned short color)
+{
+    unsigned int sx;
+    unsigned int sy;
+
+    if (x < 0 || y < 0 ||
+        x + (int)scale > P3_TEXT_BAND_W ||
+        y + (int)scale > P3_TEXT_BAND_H) {
+        return;
+    }
+
+    for (sy = 0; sy < scale; sy++) {
+        unsigned short *row = pixels + ((unsigned int)y + sy) * P3_TEXT_BAND_W + (unsigned int)x;
+        for (sx = 0; sx < scale; sx++) {
+            row[sx] = color;
+        }
+    }
+}
+
+static void Project3_DrawSafeTextToBand(const char *text, unsigned short color)
+{
+    unsigned short *pixels = (unsigned short *)(g_project3_text_buffer + P3_LCD_PIXEL_OFFSET);
+    unsigned int i;
+    unsigned int char_index;
+    unsigned int scale = 8u;
+    unsigned int text_width;
+    unsigned int max_width = P3_TEXT_BAND_W - 16u;
+    int x;
+    int y;
+
+    for (i = 0; i < P3_TEXT_BAND_W * P3_TEXT_BAND_H; i++) {
+        pixels[i] = P3_RGB565_BLACK;
+    }
+
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    while (scale > 2u) {
+        text_width = Project3_TextWidthPixels(text, scale);
+        if (text_width <= max_width && (P3_FONT_H * scale) <= (P3_TEXT_BAND_H - 8u)) {
+            break;
+        }
+        scale--;
+    }
+
+    text_width = Project3_TextWidthPixels(text, scale);
+    if (text_width > P3_TEXT_BAND_W) {
+        x = 0;
+    } else {
+        x = (int)((P3_TEXT_BAND_W - text_width) / 2u);
+    }
+    y = (int)((P3_TEXT_BAND_H - (P3_FONT_H * scale)) / 2u);
+
+    for (char_index = 0u;
+         text[char_index] != '\0' && char_index < PROJECT3_RESULT_TEXT_LEN - 1u;
+         char_index++) {
+        const unsigned char *glyph = Project3_GetGlyph(text[char_index]);
+        unsigned int gy;
+        unsigned int gx;
+
+        for (gy = 0u; gy < P3_FONT_H; gy++) {
+            unsigned char bits = glyph[gy];
+            for (gx = 0u; gx < P3_FONT_W; gx++) {
+                if (bits & (1u << (P3_FONT_W - 1u - gx))) {
+                    Project3_PutScaledPixel(pixels,
+                                            x + (int)(gx * scale),
+                                            y + (int)(gy * scale),
+                                            scale,
+                                            color);
+                }
+            }
+        }
+        x += (int)((P3_FONT_W + P3_FONT_GAP) * scale);
+        if (x >= P3_TEXT_BAND_W) {
+            break;
+        }
+    }
+}
+
+static unsigned char Project3_ClearAndDrawText(const char *text, unsigned long color)
+{
+    tDisplay text_display;
+    tContext text_context;
+    tRectangle text_rect;
+    unsigned char *src;
+    unsigned char *dst;
+    unsigned char *draw_buffer;
+    const unsigned int band_bytes = P3_TEXT_BAND_W * P3_TEXT_BAND_H * 2u;
+
+    GrOffScreen16BPPInit(&text_display, g_project3_text_buffer,
+                         P3_TEXT_BAND_W, P3_TEXT_BAND_H);
+    GrContextInit(&text_context, &text_display);
+
+    text_rect.sXMin = 0;
+    text_rect.sYMin = 0;
+    text_rect.sXMax = P3_TEXT_BAND_W - 1;
+    text_rect.sYMax = P3_TEXT_BAND_H - 1;
+
+    GrContextForegroundSet(&text_context, ClrBlack);
+    GrRectFill(&text_context, &text_rect);
+
+    GrContextForegroundSet(&text_context, color);
+    GrContextBackgroundSet(&text_context, ClrBlack);
+    GrContextFontSet(&text_context, &g_sFontCm48);
+    GrStringDrawCentered(&text_context, text, -1,
+                         P3_TEXT_BAND_W / 2,
+                         P3_TEXT_BAND_H / 2,
+                         0);
+
+    src = g_project3_text_buffer + P3_LCD_PIXEL_OFFSET;
+    draw_buffer = Lcd_GetDrawBuffer();
+    dst = draw_buffer + P3_LCD_PIXEL_OFFSET +
+          ((P3_TEXT_BAND_Y * P3_LCD_W + P3_TEXT_BAND_X) * 2u);
+
+    memcpy(dst, src, band_bytes);
+    Project3_CacheWriteBackAligned((unsigned int)dst, band_bytes);
+
+    if (!Lcd_SwapFrameBuffers()) {
+        return 0u;
+    }
+
+    draw_buffer = Lcd_GetDrawBuffer();
+    dst = draw_buffer + P3_LCD_PIXEL_OFFSET +
+          ((P3_TEXT_BAND_Y * P3_LCD_W + P3_TEXT_BAND_X) * 2u);
+    memcpy(dst, src, band_bytes);
+    Project3_CacheWriteBackAligned((unsigned int)dst, band_bytes);
+    return 1u;
 }
 
 static void Project3_InitTables(void)
@@ -391,6 +740,11 @@ static void Project3_InitTables(void)
         f_diff[i] = f_pts[i + 1] - f_pts[i];
     }
 
+    for (j = 0; j < PROJECT3_MELS_NUM; j++) {
+        g_project3_mel_first_bin[j] = PROJECT3_FREQ_NUM;
+        g_project3_mel_last_bin[j] = 0;
+    }
+
     for (i = 0; i < PROJECT3_FREQ_NUM; i++) {
         all_freq = ((float)i) * ((float)PROJECT3_MODEL_SAMPLE_RATE / 2.0f) / (float)(PROJECT3_FREQ_NUM - 1);
         for (j = 0; j < PROJECT3_MELS_NUM; j++) {
@@ -401,6 +755,19 @@ static void Project3_InitTables(void)
             float val = (left < right) ? left : right;
             if (val < 0.0f) val = 0.0f;
             g_project3_mel_filter[i * PROJECT3_MELS_NUM + j] = val;
+            if (val > 0.0f) {
+                if (i < g_project3_mel_first_bin[j]) {
+                    g_project3_mel_first_bin[j] = (unsigned short)i;
+                }
+                g_project3_mel_last_bin[j] = (unsigned short)i;
+            }
+        }
+    }
+
+    for (j = 0; j < PROJECT3_MELS_NUM; j++) {
+        if (g_project3_mel_first_bin[j] >= PROJECT3_FREQ_NUM) {
+            g_project3_mel_first_bin[j] = 0;
+            g_project3_mel_last_bin[j] = 0;
         }
     }
 
@@ -474,19 +841,54 @@ static float Project3_PaddedModelSample(int idx)
 static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter)
 {
     int n;
+    double mean = 0.0;
+    double power = 0.0;
+    float rms;
+    float gain;
+    float peak = 0.0f;
+
+    if (utter->count > 0u) {
+        unsigned int i;
+        for (i = 0; i < utter->count; i++) {
+            mean += (double)utter->raw[i];
+        }
+        mean /= (double)utter->count;
+    }
+
     for (n = 0; n < PROJECT3_MODEL_SAMPLES; n++) {
         int q = n * 5;
         int base = q >> 2;
         int rem = q & 3;
         float frac = (float)rem * 0.25f;
-        float sample = 0.0f;
+        float sample = (float)mean;
 
         if ((unsigned int)(base + 1) < utter->count) {
             sample = (1.0f - frac) * (float)utter->raw[base] + frac * (float)utter->raw[base + 1];
         } else if ((unsigned int)base < utter->count) {
             sample = (float)utter->raw[base];
         }
-        g_project3_model_wave[n] = sample / 32768.0f;
+        sample = (sample - (float)mean) / 32768.0f;
+        g_project3_model_wave[n] = sample;
+        power += (double)sample * (double)sample;
+        if (fabsf(sample) > peak) {
+            peak = fabsf(sample);
+        }
+    }
+
+    rms = sqrtf((float)(power / (double)PROJECT3_MODEL_SAMPLES));
+    if (rms > PROJECT3_WAVE_MIN_RMS && rms < PROJECT3_WAVE_TARGET_RMS) {
+        gain = PROJECT3_WAVE_TARGET_RMS / rms;
+        if (gain > PROJECT3_WAVE_MAX_GAIN) {
+            gain = PROJECT3_WAVE_MAX_GAIN;
+        }
+        if (peak > 0.0f && peak * gain > PROJECT3_WAVE_PEAK_LIMIT) {
+            gain = PROJECT3_WAVE_PEAK_LIMIT / peak;
+        }
+        if (gain > 1.0f) {
+            for (n = 0; n < PROJECT3_MODEL_SAMPLES; n++) {
+                g_project3_model_wave[n] *= gain;
+            }
+        }
     }
 }
 
@@ -516,7 +918,9 @@ static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float
 
         for (m = 0; m < PROJECT3_MELS_NUM; m++) {
             float mel_energy = 1.0e-6f;
-            for (f = 0; f < PROJECT3_FREQ_NUM; f++) {
+            int first_bin = (int)g_project3_mel_first_bin[m];
+            int last_bin = (int)g_project3_mel_last_bin[m];
+            for (f = first_bin; f <= last_bin; f++) {
                 mel_energy += g_project3_spec[f] * g_project3_mel_filter[f * PROJECT3_MELS_NUM + m];
             }
             out_logmel[m * PROJECT3_MODEL_FRAMES + frame] = logf(mel_energy);
@@ -546,20 +950,38 @@ static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len)
 static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy)
 {
     PROJECT3_VAD_STATE *vad = &ctx->vad;
-    const float floor_alpha = 0.995f;
     const float smooth_alpha = 0.90f;
+    const float floor_rise_alpha = 0.995f;
+    const float floor_fall_alpha = 0.92f;
     const float start_ratio = 4.5f;
     const float stop_ratio = 1.8f;
     const unsigned short start_frames = 4;
 
-    if (vad->noise_floor <= 0.0f) {
-        vad->noise_floor = frame_energy;
+    if (frame_energy < PROJECT3_VAD_MIN_FLOOR) {
+        frame_energy = PROJECT3_VAD_MIN_FLOOR;
     }
 
     vad->smooth_energy = smooth_alpha * vad->smooth_energy + (1.0f - smooth_alpha) * frame_energy;
 
+    if (vad->calibrate_frames < PROJECT3_VAD_CALIB_FRAMES) {
+        float cal_alpha = (vad->calibrate_frames == 0u) ? 0.0f : 0.70f;
+        vad->noise_floor = cal_alpha * vad->noise_floor + (1.0f - cal_alpha) * frame_energy;
+        vad->smooth_energy = vad->noise_floor;
+        vad->calibrate_frames++;
+        vad->speech_hold_frames = 0;
+        vad->silence_hold_frames = 0;
+        return 0;
+    }
+
     if (!vad->active) {
-        vad->noise_floor = floor_alpha * vad->noise_floor + (1.0f - floor_alpha) * vad->smooth_energy;
+        if (vad->smooth_energy > vad->noise_floor) {
+            vad->noise_floor = floor_rise_alpha * vad->noise_floor + (1.0f - floor_rise_alpha) * vad->smooth_energy;
+        } else {
+            vad->noise_floor = floor_fall_alpha * vad->noise_floor + (1.0f - floor_fall_alpha) * vad->smooth_energy;
+        }
+        if (vad->noise_floor < PROJECT3_VAD_MIN_FLOOR) {
+            vad->noise_floor = PROJECT3_VAD_MIN_FLOOR;
+        }
     }
 
     if (vad->smooth_energy > vad->noise_floor * start_ratio) {
@@ -580,6 +1002,7 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
         vad->active = 1;
         vad->speech_hold_frames = 0;
         vad->silence_hold_frames = 0;
+        Project3_SetAppState(ctx, PROJECT3_APP_SPEECH);
         return 1;
     }
 
@@ -615,6 +1038,48 @@ static void Project3_AppendRawBlock(PROJECT3_CONTEXT *ctx, const short *block, u
     unsigned int i;
     for (i = 0; i < block_samples && ctx->utter.count < PROJECT3_RAW_MAX_SAMPLES; i++) {
         ctx->utter.raw[ctx->utter.count++] = block[i];
+    }
+}
+
+static void Project3_ResetPreroll(void)
+{
+    g_project3_preroll_pos = 0;
+    g_project3_preroll_count = 0;
+}
+
+static void Project3_UpdatePreroll(const short *block, unsigned int block_samples)
+{
+    unsigned int i;
+
+    for (i = 0; i < block_samples; i++) {
+        g_project3_preroll[g_project3_preroll_pos] = block[i];
+        g_project3_preroll_pos++;
+        if (g_project3_preroll_pos >= PROJECT3_PREROLL_SAMPLES) {
+            g_project3_preroll_pos = 0;
+        }
+        if (g_project3_preroll_count < PROJECT3_PREROLL_SAMPLES) {
+            g_project3_preroll_count++;
+        }
+    }
+}
+
+static void Project3_AppendPreroll(PROJECT3_CONTEXT *ctx)
+{
+    unsigned int i;
+    unsigned int start;
+
+    if (g_project3_preroll_count == 0u) {
+        return;
+    }
+
+    start = (g_project3_preroll_pos + PROJECT3_PREROLL_SAMPLES - g_project3_preroll_count) %
+            PROJECT3_PREROLL_SAMPLES;
+    for (i = 0; i < g_project3_preroll_count && ctx->utter.count < PROJECT3_RAW_MAX_SAMPLES; i++) {
+        unsigned int idx = start + i;
+        if (idx >= PROJECT3_PREROLL_SAMPLES) {
+            idx -= PROJECT3_PREROLL_SAMPLES;
+        }
+        ctx->utter.raw[ctx->utter.count++] = g_project3_preroll[idx];
     }
 }
 
@@ -759,7 +1224,6 @@ static void Project3_BCResBlock(const float *in, float *out,
 static void Project3_BCResNetForward(const float *logmel, float *logits)
 {
     int c, w, cls, i;
-    float max_logit, sum_exp;
 
     Project3_Conv2d(logmel, g_project3_act_a, 1, 40, PROJECT3_MODEL_FRAMES,
                     16, 20, PROJECT3_MODEL_FRAMES, 3, 3, 2, 1, 1, 1, conv1_weight);
@@ -836,9 +1300,12 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
     PROJECT3_INFER_RESULT result;
     int i;
     int best = 0;
+    int second = 1;
     float max_logit = logits[0];
+    float second_logit;
     float sum_exp = 0.0f;
     float best_prob;
+    float second_prob;
 
     for (i = 1; i < PROJECT3_CMD_COUNT; i++) {
         if (logits[i] > max_logit) {
@@ -847,16 +1314,34 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
         }
     }
 
+    second = (best == 0) ? 1 : 0;
+    second_logit = logits[second];
+    for (i = 0; i < PROJECT3_CMD_COUNT; i++) {
+        if (i != best && logits[i] > second_logit) {
+            second_logit = logits[i];
+            second = i;
+        }
+    }
+
     for (i = 0; i < PROJECT3_CMD_COUNT; i++) {
         sum_exp += expf(logits[i] - max_logit);
     }
 
     best_prob = expf(logits[best] - max_logit) / sum_exp;
+    second_prob = expf(logits[second] - max_logit) / sum_exp;
     result.class_id = (unsigned char)best;
+    result.second_class_id = (unsigned char)second;
     result.confidence = best_prob;
+    result.second_confidence = second_prob;
+    result.margin = best_prob - second_prob;
     result.valid = 1;
 
-    if (best == PROJECT3_CLASS_SILENCE || best == PROJECT3_CLASS_UNKNOWN || best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD) {
+    if (best == PROJECT3_CLASS_SILENCE || best == PROJECT3_CLASS_UNKNOWN) {
+        result.valid = 0;
+    } else if ((best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
+                result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) &&
+               (best_prob < PROJECT3_INFERENCE_SOFT_CONF ||
+                result.margin < PROJECT3_INFERENCE_SOFT_MARGIN)) {
         result.valid = 0;
     }
 
@@ -866,15 +1351,11 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
 static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const PROJECT3_UTTERANCE_BUFFER *utter)
 {
     if (!result->valid) {
-        if (result->class_id != PROJECT3_CLASS_SILENCE) {
-            result->class_id = PROJECT3_CLASS_UNKNOWN;
-        }
         return 0;
     }
 
     if (result->class_id == PROJECT3_CLASS_DOWN) {
-        if (result->confidence < PROJECT3_DOWN_CONF_THRESHOLD || utter->count > PROJECT3_DOWN_MAX_SAMPLES) {
-            result->class_id = PROJECT3_CLASS_UNKNOWN;
+        if (utter->count > PROJECT3_DOWN_MAX_SAMPLES) {
             result->valid = 0;
             return 0;
         }
@@ -883,47 +1364,125 @@ static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const 
     return 1;
 }
 
+static unsigned char Project3_IsCommandClass(unsigned char class_id)
+{
+    return (class_id >= PROJECT3_CLASS_DOWN && class_id < PROJECT3_CMD_COUNT) ? 1u : 0u;
+}
+
+static const char *Project3_GetShortLabel(unsigned char class_id)
+{
+    static const char *short_labels[PROJECT3_CMD_COUNT] = {
+        "sil",
+        "unk",
+        "down",
+        "go",
+        "left",
+        "no",
+        "off",
+        "on",
+        "right",
+        "stop",
+        "up",
+        "yes"
+    };
+
+    if (class_id >= PROJECT3_CMD_COUNT) {
+        return "unk";
+    }
+    return short_labels[class_id];
+}
+
+static void Project3_FormatRawResult(const PROJECT3_INFER_RESULT *result, char *text, unsigned int text_len)
+{
+    unsigned int p1;
+    unsigned int p2;
+
+    if (text == NULL || text_len == 0u) {
+        return;
+    }
+
+    p1 = (unsigned int)(result->confidence * 100.0f + 0.5f);
+    p2 = (unsigned int)(result->second_confidence * 100.0f + 0.5f);
+    if (p1 > 99u) p1 = 99u;
+    if (p2 > 99u) p2 = 99u;
+
+    snprintf(text, text_len, "raw %s%u/%s%u",
+             Project3_GetShortLabel(result->class_id), p1,
+             Project3_GetShortLabel(result->second_class_id), p2);
+    text[text_len - 1u] = '\0';
+}
+
 static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
 {
     PROJECT3_INFER_RESULT result;
     const char *label;
+    unsigned int lcd_fault;
+    unsigned char accepted;
 
     Project3_SetAppState(ctx, PROJECT3_APP_SPEECH);
 
     result = Project3_RunInference(ctx, &ctx->utter);
-    Project3_AcceptResult(&result, &ctx->utter);
-    ctx->last_result = result;
-
-    if (result.class_id == PROJECT3_CLASS_SILENCE) {
+    lcd_fault = Lcd_GetRasterFaultStatus();
+    if (lcd_fault != 0u) {
+        ctx->lcd_fault_count++;
+        Lcd_RecoverRasterDma();
+    }
+    Project3_RequestTextRedraw(ctx);
+    if (g_project3_memory_fault) {
+        ctx->last_result = result;
+        Project3_SetAppState(ctx, PROJECT3_APP_ERROR);
+        Project3_SetUiText(ctx, "MEMORY ERROR", "", "");
+        ctx->error_hold_blocks = PROJECT3_ERROR_HOLD_BLOCKS;
         ctx->input_gate_blocks = PROJECT3_POST_INFER_IGNORE_BLOCKS;
         Project3_ResetUtterance(ctx);
-        Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-        Project3_SetUiText(ctx, "I am listening...", "", "");
+        return;
+    }
+    accepted = Project3_AcceptResult(&result, &ctx->utter);
+    ctx->input_gate_blocks = PROJECT3_POST_INFER_IGNORE_BLOCKS;
+    Project3_ResetUtterance(ctx);
+
+    if (!accepted) {
+        if (result.class_id == PROJECT3_CLASS_SILENCE) {
+            /* Silence is not a displayable result.  Keep the current word on
+             * the LCD and just resume listening; otherwise background silence
+             * decisions look like the word "flashes away" by itself. */
+            Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+            ctx->message_hold_blocks = 0;
+            ctx->message_return_to_listening = 0;
+            return;
+        }
+
+        result.valid = Project3_IsCommandClass(result.class_id);
+        ctx->last_result = result;
+        Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
+        Project3_SetUiText(ctx, Project3_GetLabel(result.class_id), "", "");
+        ctx->message_hold_blocks = 0;
+        ctx->message_return_to_listening = 0;
         return;
     }
 
+    ctx->last_result = result;
     label = Project3_GetLabel(result.class_id);
     Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
     Project3_SetUiText(ctx, label, "", "");
     ctx->recognized_count++;
-    ctx->ui_hold_blocks = PROJECT3_RESULT_HOLD_BLOCKS;
-
-    ctx->input_gate_blocks = PROJECT3_POST_INFER_IGNORE_BLOCKS;
-    Project3_ResetUtterance(ctx);
+    ctx->message_hold_blocks = 0;
+    ctx->message_return_to_listening = 0;
 }
 
-static void Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
+#if 0
+static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
 {
     unsigned long color = ClrWhite;
 
     // 防重入检查
     if (s_lcd_busy) {
-        return;
+        return 0;
     }
 
     // 只在文字真正改变时重绘
     if (!force_redraw && strncmp(ctx->main_text, ctx->last_main_text, PROJECT3_RESULT_TEXT_LEN) == 0) {
-        return;
+        return 1;
     }
 
     // 设置忙标志
@@ -945,6 +1504,37 @@ static void Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_red
 
     // 清除忙标志
     s_lcd_busy = 0;
+    return 1;
+}
+
+#endif
+
+static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
+{
+    unsigned long color;
+
+    if (s_lcd_busy) {
+        return 0;
+    }
+
+    if (!force_redraw &&
+        strncmp(ctx->main_text, ctx->last_main_text, PROJECT3_RESULT_TEXT_LEN) == 0) {
+        return 1;
+    }
+
+    s_lcd_busy = 1;
+
+    color = (strcmp(ctx->main_text, P3_LISTENING_TEXT) == 0) ? ClrLightSteelBlue : ClrWhite;
+    if (!Project3_ClearAndDrawText(ctx->main_text, color)) {
+        s_lcd_busy = 0;
+        return 0;
+    }
+
+    strncpy(ctx->last_main_text, ctx->main_text, PROJECT3_RESULT_TEXT_LEN);
+    ctx->last_main_text[PROJECT3_RESULT_TEXT_LEN - 1] = '\0';
+
+    s_lcd_busy = 0;
+    return 1;
 }
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
@@ -953,33 +1543,25 @@ static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
     ctx->pass_through_enable = PROJECT3_PASS_THROUGH_ENABLE;
     ctx->model_state = PROJECT3_MODEL_READY;
     ctx->app_state = PROJECT3_APP_BOOT;
-    ctx->vad.noise_floor = 1.0e-6f;
-    ctx->vad.smooth_energy = 1.0e-6f;
+    ctx->vad.noise_floor = PROJECT3_VAD_MIN_FLOOR;
+    ctx->vad.smooth_energy = PROJECT3_VAD_MIN_FLOOR;
     strcpy(ctx->main_text, "Booting...");
     strcpy(ctx->line1, "Initializing system");
     strcpy(ctx->line2, "Please wait");
     ctx->redraw_needed = 1;
+    Project3_ResetPreroll();
+    Project3_ResetMemoryGuard();
     Project3_InitTables();
 }
 
 static void Project3_InitUi(PROJECT3_CONTEXT *ctx)
 {
-    tRectangle fullscreen;
-
     Lcd_Init();
 
     // 防重入标志初始化
     s_lcd_busy = 0;
-    s_lcd_suspended = 0;
 
     // 全屏清屏一次（只在初始化时）- 使用固定布局宏
-    fullscreen.sXMin = 0;
-    fullscreen.sYMin = 0;
-    fullscreen.sXMax = P3_LCD_W - 1;
-    fullscreen.sYMax = P3_LCD_H - 1;
-    GrContextForegroundSet(&Lcd_Context, ClrBlack);
-    GrRectFill(&Lcd_Context, &fullscreen);
-    CacheWB((unsigned int)Lcd_Buffer, P3_LCD_BUFFER_BYTES);
 
     // 初始化 last_main_text 为空，确保第一次一定绘制
     ctx->last_main_text[0] = '\0';
@@ -998,26 +1580,45 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         FLAG_KEY1 = 0;
         // KEY1: 清除当前结果，回到 listening
         Project3_ResetUtterance(ctx);
+        Project3_ResetPreroll();
+        ctx->last_result.valid = 0;
         ctx->input_gate_blocks = 0;
-        ctx->ui_hold_blocks = 0;
+        ctx->message_hold_blocks = 0;
+        ctx->message_return_to_listening = 0;
+        ctx->error_hold_blocks = 0;
         Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-        Project3_SetUiText(ctx, "I am listening...", "", "");
+        Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
     }
     if (FLAG_KEY2) {
         FLAG_KEY2 = 0;
         // KEY2: 降低VAD灵敏度（减少误触发）
         ctx->vad.noise_floor *= 1.15f;
+        Project3_SetUiText(ctx, "VAD less sensitive", "", "");
+        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
+        ctx->message_return_to_listening = 0;
     }
     if (FLAG_KEY3) {
         FLAG_KEY3 = 0;
         // KEY3: 提高VAD灵敏度（更容易触发）
         ctx->vad.noise_floor *= 0.85f;
+        Project3_SetUiText(ctx, "VAD more sensitive", "", "");
+        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
+        ctx->message_return_to_listening = 0;
     }
     if (FLAG_KEY4) {
         FLAG_KEY4 = 0;
         // KEY4: 重置VAD基线
-        ctx->vad.noise_floor = 1.0e-6f;
-        ctx->vad.smooth_energy = 1.0e-6f;
+        Project3_ResetUtterance(ctx);
+        Project3_ResetPreroll();
+        ctx->vad.noise_floor = PROJECT3_VAD_MIN_FLOOR;
+        ctx->vad.smooth_energy = PROJECT3_VAD_MIN_FLOOR;
+        ctx->vad.calibrate_frames = 0;
+        ctx->vad.speech_hold_frames = 0;
+        ctx->vad.silence_hold_frames = 0;
+        ctx->vad.active = 0;
+        Project3_SetUiText(ctx, "Calibrating...", "", "");
+        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
+        ctx->message_return_to_listening = 0;
     }
     if (FLAG_KEY5) {
         FLAG_KEY5 = 0;
@@ -1047,14 +1648,19 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
     unsigned char block_has_speech = 0;
     unsigned char end_pending = 0;
 
-    Project3_ServiceUiHold(ctx);
+    Project3_ServiceErrorHold(ctx);
+    Project3_ServiceMessageHold(ctx);
 
-    if (ctx->input_gate_blocks > 0) {
-        ctx->input_gate_blocks--;
+    if (ctx->error_hold_blocks > 0) {
         return;
     }
 
-    if (ctx->ui_hold_blocks > 0) {
+    if (ctx->message_hold_blocks > 0) {
+        return;
+    }
+
+    if (ctx->input_gate_blocks > 0) {
+        ctx->input_gate_blocks--;
         return;
     }
 
@@ -1066,6 +1672,7 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
 
         if (started) {
             ctx->utter.ready = 0;
+            Project3_AppendPreroll(ctx);
         }
 
         if (ctx->vad.active || started) {
@@ -1081,6 +1688,8 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
 
     if (block_has_speech) {
         Project3_AppendRawBlock(ctx, block, block_samples);
+    } else {
+        Project3_UpdatePreroll(block, block_samples);
     }
 
     if (end_pending || ctx->utter.count >= PROJECT3_RAW_MAX_SAMPLES) {
@@ -1097,15 +1706,32 @@ static void Project3_ModelInit(PROJECT3_CONTEXT *ctx)
 {
     ctx->model_state = PROJECT3_MODEL_READY;
     Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-    Project3_SetUiText(ctx, "I am listening...", "", "");
+    Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
 }
 
 static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const PROJECT3_UTTERANCE_BUFFER *utter)
 {
+    PROJECT3_INFER_RESULT result;
+
     ctx->model_state = PROJECT3_MODEL_READY;
+    Project3_ResetMemoryGuard();
+    Project3_LcdPauseForInference();
+
     Project3_ExtractLogMel(utter, g_project3_logmel);
+    if (!Project3_CheckMemoryGuard()) {
+        result = Project3_MemoryFaultResult();
+        Project3_LcdResumeAfterInference();
+        return result;
+    }
     Project3_BCResNetForward(g_project3_logmel, g_project3_logits);
-    return Project3_LogitsToResult(g_project3_logits);
+    if (!Project3_CheckMemoryGuard()) {
+        result = Project3_MemoryFaultResult();
+        Project3_LcdResumeAfterInference();
+        return result;
+    }
+    result = Project3_LogitsToResult(g_project3_logits);
+    Project3_LcdResumeAfterInference();
+    return result;
 }
 
 static const char *Project3_GetLabel(unsigned char class_id)
@@ -1125,13 +1751,33 @@ static void Project3_ResetUtterance(PROJECT3_CONTEXT *ctx)
     ctx->vad.silence_hold_frames = 0;
 }
 
-static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx)
+static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx)
 {
-    if (ctx->ui_hold_blocks > 0) {
-        ctx->ui_hold_blocks--;
-        if (ctx->ui_hold_blocks == 0) {
+    if (ctx->message_hold_blocks > 0) {
+        ctx->message_hold_blocks--;
+        if (ctx->message_hold_blocks == 0) {
+            if (ctx->message_return_to_listening) {
+                ctx->message_return_to_listening = 0;
+                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+            } else if (ctx->last_result.class_id != PROJECT3_CLASS_SILENCE) {
+                Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
+                Project3_SetUiText(ctx, Project3_GetLabel(ctx->last_result.class_id), "", "");
+            } else {
+                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+            }
+        }
+    }
+}
+
+static void Project3_ServiceErrorHold(PROJECT3_CONTEXT *ctx)
+{
+    if (ctx->error_hold_blocks > 0) {
+        ctx->error_hold_blocks--;
+        if (ctx->error_hold_blocks == 0) {
             Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-            Project3_SetUiText(ctx, "I am listening...", "", "");
+            Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
         }
     }
 }
@@ -1139,8 +1785,15 @@ static void Project3_ServiceUiHold(PROJECT3_CONTEXT *ctx)
 static void Project3_UpdateUi(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
 {
     if (force_redraw || ctx->redraw_needed) {
-        Project3_RenderScreen(ctx, force_redraw);
-        ctx->redraw_needed = 0;
+        if (!force_redraw && ctx->lcd_retry_frame != 0u && ctx->frame_counter < ctx->lcd_retry_frame) {
+            return;
+        }
+        if (Project3_RenderScreen(ctx, force_redraw)) {
+            ctx->redraw_needed = 0;
+            ctx->lcd_retry_frame = 0u;
+        } else {
+            ctx->lcd_retry_frame = ctx->frame_counter + 4u;
+        }
     }
 }
 

@@ -1,61 +1,159 @@
 /**
  * @file lcd_dma.c
- * @brief LCD DMA配置实现文件
- * @details 实现LCD DMA的初始化和单缓冲配置。
- * @ingroup LCD_DMA
+ * @brief LCD DMA single-framebuffer configuration.
  */
 
-/* 头文件包含 */
-#include "lcd_dma.h"            // LCD DMA控制
-#include "lcd_grlib.h"          // LCD图形库
+#include "lcd_dma.h"
+#include "soc_C6748.h"
+#include "raster.h"
+#include "dspcache.h"
+#include "delay.h"
+#include <string.h>
 
-#include "interrupt.h"           // 提供中断控制器相关API
-#include "soc_C6748.h"           // 定义芯片所有外设寄存器的物理基地址和宏
-#include "raster.h"              // 提供光栅控制器相关的API函数
-#include "grlib.h"               // 提供图形库相关函数
-
-// 声明外部显示对象，用于在ISR中更新缓冲区指针
-extern tDisplay Lcd_Display;
-
-
-// 定义显存缓冲区数组，大小根据分辨率和色深计算（16BPP）
 #pragma DATA_SECTION(Lcd_Buffer, "offscreen_buffer")
-#pragma DATA_ALIGN(Lcd_Buffer, 4);
-unsigned char Lcd_Buffer[GrOffScreen16BPPSize(LCD_WIDTH, LCD_HEIGHT)];
+#pragma DATA_ALIGN(Lcd_Buffer, 4)
+unsigned char Lcd_Buffer[LCD_BUFFER_BYTES];
 
-// 调色板数据（用于8位色深模式）
-unsigned short palette_32b[PALETTE_SIZE/2] =
-            {0x4000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u,
-             0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u};
+#pragma DATA_SECTION(Lcd_BackBuffer, "offscreen_buffer")
+#pragma DATA_ALIGN(Lcd_BackBuffer, 4)
+static unsigned char Lcd_BackBuffer[LCD_BUFFER_BYTES];
 
+static unsigned char *s_lcd_front_buffer = Lcd_Buffer;
+static unsigned char *s_lcd_draw_buffer = Lcd_BackBuffer;
 
-// 初始化LCD DMA
-void Lcd_DMA_Init(void) 
+static unsigned short palette_32b[PALETTE_SIZE / 2] = {
+    0x4000u, 0x0000u, 0x0000u, 0x0000u,
+    0x0000u, 0x0000u, 0x0000u, 0x0000u,
+    0x0000u, 0x0000u, 0x0000u, 0x0000u,
+    0x0000u, 0x0000u, 0x0000u, 0x0000u
+};
+
+static void Lcd_CopyPalette(unsigned char *buffer)
 {
-    // 配置DMA控制寄存器：单缓冲、16字节突发、FIFO阈值8、禁用大端
+    unsigned int i;
+    unsigned char *dest = buffer + PALETTE_OFFSET;
+    unsigned char *src = (unsigned char *)palette_32b;
+
+    for (i = 0; i < PALETTE_SIZE; i++) {
+        *dest++ = *src++;
+    }
+}
+
+static void Lcd_ClearFrameBuffer(void)
+{
+    memset(Lcd_Buffer, 0, LCD_BUFFER_BYTES);
+    memset(Lcd_BackBuffer, 0, LCD_BUFFER_BYTES);
+    Lcd_CopyPalette(Lcd_Buffer);
+    Lcd_CopyPalette(Lcd_BackBuffer);
+    CacheWB((unsigned int)Lcd_Buffer, LCD_BUFFER_BYTES);
+    CacheWB((unsigned int)Lcd_BackBuffer, LCD_BUFFER_BYTES);
+}
+
+unsigned char Lcd_WaitForEndOfFrame(void)
+{
+    unsigned int status;
+    const unsigned int eof_mask = RASTER_END_OF_FRAME0_INT_STAT |
+                                  RASTER_END_OF_FRAME1_INT_STAT;
+
+    status = RasterIntStatus(SOC_LCDC_0_REGS, eof_mask);
+    if (status != 0u) {
+        RasterClearGetIntStatus(SOC_LCDC_0_REGS, status & eof_mask);
+    }
+
+    SysStartTimer(25u);
+    while (!SysIsTimerElapsed()) {
+        status = RasterIntStatus(SOC_LCDC_0_REGS, eof_mask);
+        if (status != 0u) {
+            RasterClearGetIntStatus(SOC_LCDC_0_REGS, status & eof_mask);
+            SysStopTimer();
+            return 1u;
+        }
+    }
+
+    SysStopTimer();
+    return 0u;
+}
+
+unsigned int Lcd_GetRasterFaultStatus(void)
+{
+    unsigned int raw_status;
+    unsigned int fault_status = 0u;
+    const unsigned int fault_mask = RASTER_SYNC_LOST_INT_STAT |
+                                    RASTER_FIFO_UNDERFLOW_INT_STAT;
+
+    raw_status = RasterIntStatus(SOC_LCDC_0_REGS, fault_mask);
+    if ((raw_status & RASTER_SYNC_LOST_INT_STAT) != 0u) {
+        fault_status |= LCD_RASTER_FAULT_SYNC_LOST;
+    }
+    if ((raw_status & RASTER_FIFO_UNDERFLOW_INT_STAT) != 0u) {
+        fault_status |= LCD_RASTER_FAULT_FIFO_UNDERFLOW;
+    }
+
+    if ((raw_status & fault_mask) != 0u) {
+        RasterClearGetIntStatus(SOC_LCDC_0_REGS, raw_status & fault_mask);
+    }
+
+    return fault_status;
+}
+
+unsigned char *Lcd_GetDrawBuffer(void)
+{
+    return s_lcd_draw_buffer;
+}
+
+void Lcd_RecoverRasterDma(void)
+{
+    RasterDisable(SOC_LCDC_0_REGS);
+
     RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_SINGLE_FRAME_BUFFER,
                     RASTER_BURST_SIZE_16, RASTER_FIFO_THRESHOLD_8,
                     RASTER_BIG_ENDIAN_DISABLE);
-                    
-    // 使能帧结束中断
+
     RasterEndOfFrameIntEnable(SOC_LCDC_0_REGS);
-
-    // 配置帧缓冲器0地址
     RasterDMAFBConfig(SOC_LCDC_0_REGS,
-                    (unsigned int)(Lcd_Buffer + PALETTE_OFFSET),
-                    (unsigned int)(Lcd_Buffer + PALETTE_OFFSET) + sizeof(Lcd_Buffer) - 2 - PALETTE_OFFSET,
-                    LCD_FRAME_0);
+                      (unsigned int)(s_lcd_front_buffer + PALETTE_OFFSET),
+                      (unsigned int)(s_lcd_front_buffer + LCD_BUFFER_BYTES - 2),
+                      LCD_FRAME_0);
+    (void)Lcd_GetRasterFaultStatus();
+    RasterEnable(SOC_LCDC_0_REGS);
+}
 
-    // 拷贝调色板到两个缓冲区
-    unsigned int i = 0;
-    unsigned char *dest;
-    unsigned char *src;
-    
-    src = (unsigned char *)palette_32b;
-    dest = (unsigned char *)(Lcd_Buffer + PALETTE_OFFSET);
-    for(i = PALETTE_OFFSET; i < (PALETTE_SIZE + PALETTE_OFFSET); i++)
-    {
-        *dest++ = *src++;
+unsigned char Lcd_SwapFrameBuffers(void)
+{
+    unsigned char *old_front;
+
+    if (!Lcd_WaitForEndOfFrame()) {
+        Lcd_RecoverRasterDma();
+        return 0u;
     }
 
+    old_front = s_lcd_front_buffer;
+    s_lcd_front_buffer = s_lcd_draw_buffer;
+    s_lcd_draw_buffer = old_front;
+
+    RasterDMAFBConfig(SOC_LCDC_0_REGS,
+                      (unsigned int)(s_lcd_front_buffer + PALETTE_OFFSET),
+                      (unsigned int)(s_lcd_front_buffer + LCD_BUFFER_BYTES - 2),
+                      LCD_FRAME_0);
+    (void)Lcd_GetRasterFaultStatus();
+
+    return 1u;
+}
+
+void Lcd_DMA_Init(void)
+{
+    Lcd_ClearFrameBuffer();
+    s_lcd_front_buffer = Lcd_Buffer;
+    s_lcd_draw_buffer = Lcd_BackBuffer;
+
+    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_SINGLE_FRAME_BUFFER,
+                    RASTER_BURST_SIZE_16, RASTER_FIFO_THRESHOLD_8,
+                    RASTER_BIG_ENDIAN_DISABLE);
+
+    RasterEndOfFrameIntEnable(SOC_LCDC_0_REGS);
+    (void)Lcd_GetRasterFaultStatus();
+    RasterDMAFBConfig(SOC_LCDC_0_REGS,
+                      (unsigned int)(s_lcd_front_buffer + PALETTE_OFFSET),
+                      (unsigned int)(s_lcd_front_buffer + LCD_BUFFER_BYTES - 2),
+                      LCD_FRAME_0);
 }

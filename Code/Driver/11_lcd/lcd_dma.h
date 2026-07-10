@@ -30,14 +30,24 @@
 
 #define PALETTE_SIZE    32
 #define PALETTE_OFFSET  4
+#define LCD_BUFFER_BYTES  (4 + PALETTE_SIZE + LCD_WIDTH * LCD_HEIGHT * 2)
 
 #define LCD_FRAME_0  0
 #define LCD_FRAME_1  1
+
+#define LCD_RASTER_FAULT_SYNC_LOST       (1u << 0)
+#define LCD_RASTER_FAULT_FIFO_UNDERFLOW  (1u << 1)
 
 /// @endcond /* INTERNAL_MACROS 结束 */
 
 
 extern unsigned char Lcd_Buffer[];
+
+unsigned char Lcd_WaitForEndOfFrame(void);
+unsigned int Lcd_GetRasterFaultStatus(void);
+unsigned char *Lcd_GetDrawBuffer(void);
+unsigned char Lcd_SwapFrameBuffers(void);
+void Lcd_RecoverRasterDma(void);
 
 
 /**

@@ -31,7 +31,8 @@ MEMORY
     //SHRAM        o = 0x80000000  l = 0x00020000   /* 128kB Shared RAM */
     SHRAM        o = 0x80010000  l = 0x00010000   /* 128kB Shared RAM */
     //DDR2         o = 0xC0000000  l = 0x08000000   /* 128MB DDR2 Data */
-    DDR2         o = 0xC0000000  l = 0x06FFFFF0   /* 128MB DDR2 Data */
+    DDR2         o = 0xC0000000  l = 0x06000000   /* App/model DDR2 region: keep away from LCD DMA */
+    LCD_FB       o = 0xC6000000  l = 0x00200000   /* Dedicated LCD double-framebuffer region */
 }                                              
                                                
 SECTIONS                                       
@@ -71,5 +72,5 @@ SECTIONS
     .c6xabi.extab  >  DDR2
 
     /* new sections */
-    offscreen_buffer > DDR2
+    offscreen_buffer > LCD_FB
 }
