@@ -39,7 +39,6 @@
 #define P3_TEXT_BAND_H          P3_TEXT_AREA_H
 #define P3_TEXT_BUFFER_BYTES    (4 + 32 + P3_TEXT_BAND_W * P3_TEXT_BAND_H * 2)
 #define P3_LISTENING_TEXT       "Listening..."
-#define PROJECT3_LCD_KEEPALIVE_FRAMES      100u
 #define P3_FONT_W               5
 #define P3_FONT_H               7
 #define P3_FONT_GAP             1
@@ -195,7 +194,6 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx);
 static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx);
 static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsigned int block_samples);
 static void Project3_UpdateUi(PROJECT3_CONTEXT *ctx, unsigned char force_redraw);
-static void Project3_ServiceLcdHealth(PROJECT3_CONTEXT *ctx);
 static void Project3_ModelInit(PROJECT3_CONTEXT *ctx);
 static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const PROJECT3_UTTERANCE_BUFFER *utter);
 static const char *Project3_GetLabel(unsigned char class_id);
@@ -430,19 +428,6 @@ static void Project3_RequestTextRedraw(PROJECT3_CONTEXT *ctx)
     ctx->lcd_retry_frame = 0u;
 }
 
-static void Project3_ServiceLcdHealth(PROJECT3_CONTEXT *ctx)
-{
-    unsigned int lcd_fault = Lcd_GetRasterFaultStatus();
-
-    if (lcd_fault != 0u) {
-        ctx->lcd_fault_count++;
-        Lcd_RecoverRasterDma();
-        Project3_RequestTextRedraw(ctx);
-    } else if ((ctx->frame_counter - ctx->lcd_last_redraw_frame) >= PROJECT3_LCD_KEEPALIVE_FRAMES) {
-        Project3_RequestTextRedraw(ctx);
-    }
-}
-
 static void Project3_ResetMemoryGuard(void)
 {
     unsigned int i;
@@ -661,8 +646,11 @@ static unsigned char Project3_ClearAndDrawText(const char *text, unsigned long c
     tRectangle text_rect;
     unsigned char *src;
     unsigned char *dst;
-    unsigned char *draw_buffer;
-    const unsigned int band_bytes = P3_TEXT_BAND_W * P3_TEXT_BAND_H * 2u;
+    const unsigned int row_bytes = P3_TEXT_BAND_W * 2u;
+    const unsigned int lcd_row_bytes = P3_LCD_W * 2u;
+    const unsigned int writeback_bytes =
+        (((P3_TEXT_BAND_H - 1u) * P3_LCD_W) + P3_TEXT_BAND_W) * 2u;
+    unsigned int row;
 
     GrOffScreen16BPPInit(&text_display, g_project3_text_buffer,
                          P3_TEXT_BAND_W, P3_TEXT_BAND_H);
@@ -685,22 +673,17 @@ static unsigned char Project3_ClearAndDrawText(const char *text, unsigned long c
                          0);
 
     src = g_project3_text_buffer + P3_LCD_PIXEL_OFFSET;
-    draw_buffer = Lcd_GetDrawBuffer();
-    dst = draw_buffer + P3_LCD_PIXEL_OFFSET +
+    dst = Lcd_Buffer + P3_LCD_PIXEL_OFFSET +
           ((P3_TEXT_BAND_Y * P3_LCD_W + P3_TEXT_BAND_X) * 2u);
 
-    memcpy(dst, src, band_bytes);
-    Project3_CacheWriteBackAligned((unsigned int)dst, band_bytes);
-
-    if (!Lcd_SwapFrameBuffers()) {
+    if (!Lcd_WaitForEndOfFrame()) {
         return 0u;
     }
 
-    draw_buffer = Lcd_GetDrawBuffer();
-    dst = draw_buffer + P3_LCD_PIXEL_OFFSET +
-          ((P3_TEXT_BAND_Y * P3_LCD_W + P3_TEXT_BAND_X) * 2u);
-    memcpy(dst, src, band_bytes);
-    Project3_CacheWriteBackAligned((unsigned int)dst, band_bytes);
+    for (row = 0u; row < P3_TEXT_BAND_H; row++) {
+        memcpy(dst + row * lcd_row_bytes, src + row * row_bytes, row_bytes);
+    }
+    Project3_CacheWriteBackAligned((unsigned int)dst, writeback_bytes);
     return 1u;
 }
 
@@ -1338,10 +1321,8 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
 
     if (best == PROJECT3_CLASS_SILENCE || best == PROJECT3_CLASS_UNKNOWN) {
         result.valid = 0;
-    } else if ((best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
-                result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) &&
-               (best_prob < PROJECT3_INFERENCE_SOFT_CONF ||
-                result.margin < PROJECT3_INFERENCE_SOFT_MARGIN)) {
+    } else if (best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
+               result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) {
         result.valid = 0;
     }
 
@@ -1416,18 +1397,11 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
 {
     PROJECT3_INFER_RESULT result;
     const char *label;
-    unsigned int lcd_fault;
     unsigned char accepted;
 
     Project3_SetAppState(ctx, PROJECT3_APP_SPEECH);
 
     result = Project3_RunInference(ctx, &ctx->utter);
-    lcd_fault = Lcd_GetRasterFaultStatus();
-    if (lcd_fault != 0u) {
-        ctx->lcd_fault_count++;
-        Lcd_RecoverRasterDma();
-    }
-    Project3_RequestTextRedraw(ctx);
     if (g_project3_memory_fault) {
         ctx->last_result = result;
         Project3_SetAppState(ctx, PROJECT3_APP_ERROR);
@@ -1442,20 +1416,10 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     Project3_ResetUtterance(ctx);
 
     if (!accepted) {
-        if (result.class_id == PROJECT3_CLASS_SILENCE) {
-            /* Silence is not a displayable result.  Keep the current word on
-             * the LCD and just resume listening; otherwise background silence
-             * decisions look like the word "flashes away" by itself. */
-            Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-            ctx->message_hold_blocks = 0;
-            ctx->message_return_to_listening = 0;
-            return;
-        }
-
-        result.valid = Project3_IsCommandClass(result.class_id);
-        ctx->last_result = result;
-        Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
-        Project3_SetUiText(ctx, Project3_GetLabel(result.class_id), "", "");
+        /* Silence, explicit unknown, and low-confidence command guesses are
+         * not displayable in the first-stage LCD fix.  Keep the previous
+         * stable word on the LCD and avoid triggering a redraw. */
+        Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
         ctx->message_hold_blocks = 0;
         ctx->message_return_to_listening = 0;
         return;

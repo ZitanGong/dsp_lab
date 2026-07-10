@@ -34,7 +34,6 @@ int main(void)
             FLAG_AD = 0;
             Project3_CopyInputBlock(g_project3_input_block);
             Project3_ProcessAudioBlock(&ctx, g_project3_input_block, PROJECT3_BLOCK_SAMPLES);
-            Project3_ServiceLcdHealth(&ctx);
             Project3_FillDacOutput(&ctx, g_project3_input_block);
             Project3_WriteOutputBlockToDac(g_project3_output_block);
             FLAG_DA = 0;
