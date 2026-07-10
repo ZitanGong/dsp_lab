@@ -12,13 +12,14 @@ Release/
 *.tmp
 *.bak
 *~
-.settings/
 .launches/
 
 # IDE配置
-.ccsproject
-.cproject
-.project
+!.ccsproject
+!.cproject
+!.project
+!.settings/
+!.settings/**
 targetConfigs/
 
 # Windows
