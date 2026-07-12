@@ -26,5 +26,12 @@ void Lcd_Init(void)
     Lcd_DMA_Init();
     Lcd_Grlib_Init();
     Lcd_Raster_Enable();
+
+    /* Silicon erratum 2.1.3: DDR refresh can underflow the LCD FIFO during
+     * startup.  Validate the first frame before the application starts
+     * drawing, and perform the required module reset if needed. */
+    if (!Lcd_WaitForEndOfFrame() || Lcd_GetRasterFaultStatus() != 0u) {
+        Lcd_RecoverRasterDma();
+    }
     // Lcd_Widget_Init();
 }

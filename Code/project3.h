@@ -18,12 +18,10 @@
 // ============================================================
 #define P3_LCD_W                800
 #define P3_LCD_H                480
-#define P3_TEXT_AREA_X          100
-#define P3_TEXT_AREA_Y          180
-#define P3_TEXT_AREA_W          600
-#define P3_TEXT_AREA_H          120
-#define P3_TEXT_X               200
-#define P3_TEXT_Y               215
+#define P3_TEXT_AREA_X          80
+#define P3_TEXT_AREA_Y          135
+#define P3_TEXT_AREA_W          640
+#define P3_TEXT_AREA_H          210
 
 // 坐标裁剪宏
 #define P3_CLAMP_X(x)           (((x) < 0) ? 0 : (((x) >= P3_LCD_W) ? (P3_LCD_W - 1) : (x)))
@@ -37,6 +35,10 @@
 #define P3_TEXT_BAND_Y          P3_TEXT_AREA_Y
 #define P3_TEXT_BAND_W          P3_TEXT_AREA_W
 #define P3_TEXT_BAND_H          P3_TEXT_AREA_H
+#define P3_DYNAMIC_X            24
+#define P3_DYNAMIC_Y            64
+#define P3_DYNAMIC_W            (P3_TEXT_BAND_W - 48)
+#define P3_DYNAMIC_H            122
 #define P3_TEXT_BUFFER_BYTES    (4 + 32 + P3_TEXT_BAND_W * P3_TEXT_BAND_H * 2)
 #define P3_LISTENING_TEXT       "Listening..."
 #define P3_FONT_W               5
@@ -44,7 +46,12 @@
 #define P3_FONT_GAP             1
 #define P3_RGB565_BLACK         0x0000u
 #define P3_RGB565_WHITE         0xFFFFu
-#define P3_RGB565_IDLE          0xB63Bu
+#define P3_RGB565_PANEL         0x0862u
+#define P3_RGB565_PANEL_INNER   0x10C4u
+#define P3_RGB565_BORDER        0x2E7Fu
+#define P3_RGB565_MUTED         0x8410u
+#define P3_RGB565_IDLE          0x9E7Fu
+#define P3_RGB565_RESULT        0xFFFFu
 #define PROJECT3_LCD_PAUSE_DURING_INFERENCE 0
 
 #define PROJECT3_PI                         3.14159265358979323846f
@@ -56,6 +63,7 @@
 #define PROJECT3_DAC_CHANNEL_MASK           DAC_CHANNEL_1
 #define PROJECT3_HW_SAMPLE_RATE             20000
 #define PROJECT3_MODEL_SAMPLE_RATE          16000
+#define PROJECT3_DSP_CLOCK_HZ               456000000u
 
 /* One command is normalized to the same 1-second waveform used by train_bcresnet.py. */
 #define PROJECT3_RAW_MAX_SAMPLES            PROJECT3_HW_SAMPLE_RATE
@@ -70,25 +78,28 @@
 #define PROJECT3_MELS_NUM                   40
 #define PROJECT3_MODEL_FRAMES               101
 #define PROJECT3_CMD_COUNT                  12
+#define PROJECT3_FEATURE_COUNT              (PROJECT3_MELS_NUM * PROJECT3_MODEL_FRAMES)
 
 #define PROJECT3_UI_TEXT_LEN                64
 #define PROJECT3_RESULT_TEXT_LEN            32
 #define PROJECT3_PASS_THROUGH_ENABLE        0
-#define PROJECT3_INFERENCE_CONF_THRESHOLD   0.40f
-#define PROJECT3_INFERENCE_MARGIN_THRESHOLD 0.08f
-#define PROJECT3_INFERENCE_SOFT_CONF        0.25f
-#define PROJECT3_INFERENCE_SOFT_MARGIN      0.02f
+#define PROJECT3_INFERENCE_CONF_THRESHOLD     0.55f
+#define PROJECT3_INFERENCE_MARGIN_THRESHOLD   0.12f
+#define PROJECT3_UNKNOWN_COMPETITOR_THRESHOLD 0.25f
+#define PROJECT3_UNKNOWN_COMMAND_OVERRIDE     0.65f
+#define PROJECT3_FEATURE_NORM_EPS             1.0e-6f
 #define PROJECT3_WAVE_TARGET_RMS            0.10f
 #define PROJECT3_WAVE_MAX_GAIN              16.0f
 #define PROJECT3_WAVE_PEAK_LIMIT            0.98f
 #define PROJECT3_WAVE_MIN_RMS               1.0e-5f
-#define PROJECT3_DOWN_MAX_SAMPLES           (PROJECT3_HW_SAMPLE_RATE * 6 / 10)
 #define PROJECT3_MIN_UTTERANCE_SAMPLES      (PROJECT3_HW_SAMPLE_RATE / 5)
-#define PROJECT3_POST_INFER_IGNORE_BLOCKS   8
+#define PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES  (PROJECT3_HW_SAMPLE_RATE / 8)
+#define PROJECT3_VAD_ABS_START_ENERGY       2.5e-6f
+#define PROJECT3_POST_INFER_IGNORE_BLOCKS   20
 #define PROJECT3_MESSAGE_HOLD_BLOCKS        20
 #define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE * 3 / PROJECT3_BLOCK_SAMPLES) + 1)
 #define PROJECT3_ERROR_HOLD_BLOCKS          50
-#define PROJECT3_VAD_CALIB_FRAMES           12
+#define PROJECT3_VAD_CALIB_FRAMES           40
 #define PROJECT3_VAD_MIN_FLOOR              1.0e-8f
 
 #define PROJECT3_CENTER_X                   400
@@ -179,6 +190,7 @@ typedef struct {
     unsigned long lcd_retry_frame;
     unsigned long lcd_fault_count;
     unsigned long lcd_last_redraw_frame;
+    unsigned int active_speech_samples;
     unsigned char pass_through_enable;
     unsigned char input_gate_blocks;
     unsigned char message_hold_blocks;
@@ -191,6 +203,7 @@ typedef struct {
 // LCD防重入标志
 static volatile int s_lcd_busy = 0;
 static volatile int s_lcd_infer_paused = 0;
+static unsigned char s_lcd_layout_ready = 0u;
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx);
 static void Project3_InitUi(PROJECT3_CONTEXT *ctx);
@@ -209,8 +222,8 @@ static void Project3_ResetPreroll(void);
 #define P3_DW(c, kh, kw, KH, KW)     (((c) * (KH) + (kh)) * (KW) + (kw))
 
 static const char *g_project3_labels[PROJECT3_CMD_COUNT] = {
-    "_silence_",
-    "_unknown_",
+    "silence",
+    "unknown",
     "down",
     "go",
     "left",
@@ -284,59 +297,27 @@ static unsigned short g_project3_mel_first_bin[PROJECT3_MELS_NUM];
 static unsigned short g_project3_mel_last_bin[PROJECT3_MELS_NUM];
 static unsigned char g_project3_tables_ready = 0;
 static volatile unsigned char g_project3_memory_fault = 0;
+volatile unsigned long g_project3_last_inference_ms = 0u;
+volatile unsigned long g_project3_last_utterance_samples = 0u;
+volatile unsigned long g_project3_audio_block_count = 0u;
+volatile unsigned long g_project3_vad_start_count = 0u;
+volatile unsigned long g_project3_vad_end_count = 0u;
+volatile unsigned long g_project3_current_utterance_samples = 0u;
+volatile float g_project3_last_frame_energy = 0.0f;
+volatile float g_project3_vad_noise_floor = 0.0f;
+volatile float g_project3_vad_smooth_energy = 0.0f;
+volatile short g_project3_audio_peak = 0;
+volatile unsigned char g_project3_raw_top_class = PROJECT3_CLASS_SILENCE;
+volatile unsigned char g_project3_raw_second_class = PROJECT3_CLASS_SILENCE;
+volatile unsigned char g_project3_result_accepted = 0u;
+volatile unsigned int g_project3_raw_top_permille = 0u;
+volatile unsigned int g_project3_raw_second_permille = 0u;
+volatile unsigned int g_project3_raw_margin_permille = 0u;
 
 extern unsigned char Lcd_Buffer[];
 
 #pragma DATA_ALIGN(g_project3_text_buffer, 128)
 static unsigned char g_project3_text_buffer[P3_TEXT_BUFFER_BYTES];
-
-static const unsigned char g_project3_font_digits[10][P3_FONT_H] = {
-    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},
-    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
-    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
-    {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E},
-    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
-    {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E},
-    {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E},
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
-    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
-    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}
-};
-
-static const unsigned char g_project3_font_letters[26][P3_FONT_H] = {
-    {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
-    {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
-    {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
-    {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
-    {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F},
-    {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
-    {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
-    {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C},
-    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
-    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
-    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
-    {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
-    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
-    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
-    {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
-    {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
-    {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
-    {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
-    {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04},
-    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
-    {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
-    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}
-};
-
-static const unsigned char g_project3_font_blank[P3_FONT_H] = {0, 0, 0, 0, 0, 0, 0};
-static const unsigned char g_project3_font_dot[P3_FONT_H] = {0, 0, 0, 0, 0, 0x0C, 0x0C};
-static const unsigned char g_project3_font_dash[P3_FONT_H] = {0, 0, 0, 0x1F, 0, 0, 0};
-static const unsigned char g_project3_font_under[P3_FONT_H] = {0, 0, 0, 0, 0, 0, 0x1F};
-static const unsigned char g_project3_font_qmark[P3_FONT_H] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0, 0x04};
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state);
 static void Project3_SetUiText(PROJECT3_CONTEXT *ctx, const char *main_text, const char *line1, const char *line2);
@@ -349,6 +330,7 @@ static void Project3_Fft512(float *re, float *im);
 static float Project3_PaddedModelSample(int idx);
 static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter);
 static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float *out_logmel);
+static void Project3_NormalizeLogMel(float *logmel);
 static void Project3_FormatRawResult(const PROJECT3_INFER_RESULT *result, char *text, unsigned int text_len);
 static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len);
 static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy);
@@ -400,7 +382,7 @@ static void Project3_BCResBlock(const float *in, float *out,
                                 const float *shortcut_bn_m, const float *shortcut_bn_v);
 static void Project3_BCResNetForward(const float *logmel, float *logits);
 static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits);
-static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const PROJECT3_UTTERANCE_BUFFER *utter);
+static unsigned char Project3_AcceptResult(const PROJECT3_INFER_RESULT *result);
 static unsigned char Project3_IsCommandClass(unsigned char class_id);
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state)
@@ -459,23 +441,27 @@ static void Project3_ClearStableDisplay(PROJECT3_CONTEXT *ctx)
 
 static void Project3_CommitStableWord(PROJECT3_CONTEXT *ctx, const char *label)
 {
+    unsigned char changed;
+
     if (label == NULL || label[0] == '\0') {
         return;
     }
 
+    changed = (!ctx->stable_text_valid ||
+               strncmp(ctx->stable_text, label, PROJECT3_RESULT_TEXT_LEN) != 0);
     strncpy(ctx->stable_text, label, PROJECT3_RESULT_TEXT_LEN - 1);
     ctx->stable_text[PROJECT3_RESULT_TEXT_LEN - 1] = '\0';
     ctx->stable_text_valid = 1u;
     Project3_SetAppState(ctx, PROJECT3_APP_RESULT);
     Project3_SetUiText(ctx, ctx->stable_text, "", "");
 
-    /*
-     * A valid recognition is an explicit display event.  Force one redraw even
-     * when the recognized word equals the previous word, because the LCD panel
-     * can have lost the physical contents while the software text string is
-     * unchanged.
-     */
-    Project3_RequestTextRedraw(ctx);
+    /* Repainting an unchanged word needlessly touches both DMA buffers and is
+     * visible as a flash.  A changed label is already marked dirty by
+     * Project3_SetUiText(); only repair the dirty flag if the saved state was
+     * invalid but the character data happened to compare equal. */
+    if (changed) {
+        ctx->redraw_needed = 1u;
+    }
 }
 
 static void Project3_RestoreStableDisplay(PROJECT3_CONTEXT *ctx)
@@ -564,159 +550,114 @@ static void Project3_LcdResumeAfterInference(void)
 #endif
 }
 
-static unsigned short Project3_ColorToRgb565(unsigned long color)
+static void Project3_DrawSafeTextToBand(const char *text, unsigned long color)
 {
-    unsigned int r = (unsigned int)((color >> 16) & 0xFFu);
-    unsigned int g = (unsigned int)((color >> 8) & 0xFFu);
-    unsigned int b = (unsigned int)(color & 0xFFu);
+    tDisplay display;
+    tContext context;
+    tRectangle rect;
+    const tFont *main_font;
+    unsigned long main_color;
 
-    return (unsigned short)(((r & 0xF8u) << 8) |
-                            ((g & 0xFCu) << 3) |
-                            (b >> 3));
-}
+    GrOffScreen16BPPInit(&display, g_project3_text_buffer,
+                         P3_TEXT_BAND_W, P3_TEXT_BAND_H);
+    GrContextInit(&context, &display);
 
-static const unsigned char *Project3_GetGlyph(char ch)
-{
-    if (ch >= '0' && ch <= '9') {
-        return g_project3_font_digits[ch - '0'];
-    }
-    if (ch >= 'a' && ch <= 'z') {
-        return g_project3_font_letters[ch - 'a'];
-    }
-    if (ch >= 'A' && ch <= 'Z') {
-        return g_project3_font_letters[ch - 'A'];
-    }
-    if (ch == '.') {
-        return g_project3_font_dot;
-    }
-    if (ch == '-') {
-        return g_project3_font_dash;
-    }
-    if (ch == '_') {
-        return g_project3_font_under;
-    }
-    if (ch == ' ') {
-        return g_project3_font_blank;
-    }
-    return g_project3_font_qmark;
-}
+    rect.sXMin = 0;
+    rect.sYMin = 0;
+    rect.sXMax = P3_TEXT_BAND_W - 1;
+    rect.sYMax = P3_TEXT_BAND_H - 1;
+    GrContextForegroundSet(&context, ClrBlack);
+    GrRectFill(&context, &rect);
 
-static unsigned int Project3_TextWidthPixels(const char *text, unsigned int scale)
-{
-    unsigned int chars = 0u;
+    rect.sXMin = 8;
+    rect.sYMin = 8;
+    rect.sXMax = P3_TEXT_BAND_W - 9;
+    rect.sYMax = P3_TEXT_BAND_H - 9;
+    GrContextForegroundSet(&context, 0x081A2Au);
+    GrRectFill(&context, &rect);
+    GrContextForegroundSet(&context, 0x32C9D6u);
+    GrRectDraw(&context, &rect);
 
-    while (text != NULL && text[chars] != '\0' && chars < PROJECT3_RESULT_TEXT_LEN - 1u) {
-        chars++;
-    }
+    rect.sXMin = 14;
+    rect.sYMin = 14;
+    rect.sXMax = P3_TEXT_BAND_W - 15;
+    rect.sYMax = P3_TEXT_BAND_H - 15;
+    GrContextForegroundSet(&context, 0x17405Cu);
+    GrRectDraw(&context, &rect);
 
-    if (chars == 0u) {
-        return 0u;
-    }
-    return (((P3_FONT_W + P3_FONT_GAP) * chars) - P3_FONT_GAP) * scale;
-}
+    GrContextFontSet(&context, &g_sFontCm20);
+    GrContextForegroundSet(&context, 0x86A9C0u);
+    GrContextBackgroundSet(&context, 0x081A2Au);
+    GrStringDrawCentered(&context, "VOICE COMMAND", -1,
+                         P3_TEXT_BAND_W / 2, 36, 0);
 
-static void Project3_PutScaledPixel(unsigned short *pixels,
-                                    int x, int y,
-                                    unsigned int scale,
-                                    unsigned short color)
-{
-    unsigned int sx;
-    unsigned int sy;
-
-    if (x < 0 || y < 0 ||
-        x + (int)scale > P3_TEXT_BAND_W ||
-        y + (int)scale > P3_TEXT_BAND_H) {
-        return;
-    }
-
-    for (sy = 0; sy < scale; sy++) {
-        unsigned short *row = pixels + ((unsigned int)y + sy) * P3_TEXT_BAND_W + (unsigned int)x;
-        for (sx = 0; sx < scale; sx++) {
-            row[sx] = color;
-        }
-    }
-}
-
-static void Project3_DrawSafeTextToBand(const char *text, unsigned short color)
-{
-    unsigned short *pixels = (unsigned short *)(g_project3_text_buffer + P3_LCD_PIXEL_OFFSET);
-    unsigned int i;
-    unsigned int char_index;
-    unsigned int scale = 8u;
-    unsigned int text_width;
-    unsigned int max_width = P3_TEXT_BAND_W - 16u;
-    int x;
-    int y;
-
-    for (i = 0; i < P3_TEXT_BAND_W * P3_TEXT_BAND_H; i++) {
-        pixels[i] = P3_RGB565_BLACK;
-    }
+    GrContextForegroundSet(&context, 0x17405Cu);
+    GrLineDraw(&context, 28, 60, P3_TEXT_BAND_W - 29, 60);
 
     if (text == NULL || text[0] == '\0') {
         return;
     }
 
-    while (scale > 2u) {
-        text_width = Project3_TextWidthPixels(text, scale);
-        if (text_width <= max_width && (P3_FONT_H * scale) <= (P3_TEXT_BAND_H - 8u)) {
-            break;
-        }
-        scale--;
+    main_font = &g_sFontCm48b;
+    GrContextFontSet(&context, main_font);
+    if (GrStringWidthGet(&context, text, -1) > P3_DYNAMIC_W - 40) {
+        main_font = &g_sFontCm36b;
+        GrContextFontSet(&context, main_font);
+    }
+    if (GrStringWidthGet(&context, text, -1) > P3_DYNAMIC_W - 40) {
+        main_font = &g_sFontCm30b;
+        GrContextFontSet(&context, main_font);
+    }
+    if (GrStringWidthGet(&context, text, -1) > P3_DYNAMIC_W - 40) {
+        main_font = &g_sFontCm24b;
+        GrContextFontSet(&context, main_font);
     }
 
-    text_width = Project3_TextWidthPixels(text, scale);
-    if (text_width > P3_TEXT_BAND_W) {
-        x = 0;
-    } else {
-        x = (int)((P3_TEXT_BAND_W - text_width) / 2u);
-    }
-    y = (int)((P3_TEXT_BAND_H - (P3_FONT_H * scale)) / 2u);
+    main_color = (strcmp(text, P3_LISTENING_TEXT) == 0) ?
+                 0x8FD8E8u : color;
+    GrContextForegroundSet(&context, main_color);
+    GrContextBackgroundSet(&context, 0x081A2Au);
+    GrStringDrawCentered(&context, text, -1,
+                         P3_TEXT_BAND_W / 2, 128, 0);
 
-    for (char_index = 0u;
-         text[char_index] != '\0' && char_index < PROJECT3_RESULT_TEXT_LEN - 1u;
-         char_index++) {
-        const unsigned char *glyph = Project3_GetGlyph(text[char_index]);
-        unsigned int gy;
-        unsigned int gx;
-
-        for (gy = 0u; gy < P3_FONT_H; gy++) {
-            unsigned char bits = glyph[gy];
-            for (gx = 0u; gx < P3_FONT_W; gx++) {
-                if (bits & (1u << (P3_FONT_W - 1u - gx))) {
-                    Project3_PutScaledPixel(pixels,
-                                            x + (int)(gx * scale),
-                                            y + (int)(gy * scale),
-                                            scale,
-                                            color);
-                }
-            }
-        }
-        x += (int)((P3_FONT_W + P3_FONT_GAP) * scale);
-        if (x >= P3_TEXT_BAND_W) {
-            break;
-        }
-    }
+    GrContextForegroundSet(&context,
+                           (strcmp(text, P3_LISTENING_TEXT) == 0) ?
+                           0x8FD8E8u : 0x32C9D6u);
+    GrLineDraw(&context,
+               P3_TEXT_BAND_W / 2 - 28, P3_TEXT_BAND_H - 25,
+               P3_TEXT_BAND_W / 2 + 28, P3_TEXT_BAND_H - 25);
 }
 
 static unsigned char Project3_ClearAndDrawText(const char *text, unsigned long color)
 {
     unsigned char *src;
     const unsigned int row_bytes = P3_TEXT_BAND_W * 2u;
+    unsigned char updated;
 
-    /*
-     * Do not use GrLib offscreen rendering here.  The LCD framebuffer has a
-     * palette/header prefix, while Project3 only needs a deterministic text
-     * band.  Drawing pixels ourselves removes the library's image-header and
-     * coordinate assumptions from the speech-result display path.
-     */
-    Project3_DrawSafeTextToBand(text, Project3_ColorToRgb565(color));
+    Project3_DrawSafeTextToBand(text, color);
 
     src = g_project3_text_buffer + P3_LCD_PIXEL_OFFSET;
+    if (!s_lcd_layout_ready) {
+        updated = Lcd_UpdateRegionToBothBuffers(src,
+                                                P3_TEXT_BAND_X,
+                                                P3_TEXT_BAND_Y,
+                                                P3_TEXT_BAND_W,
+                                                P3_TEXT_BAND_H,
+                                                row_bytes);
+        if (updated) {
+            s_lcd_layout_ready = 1u;
+        }
+        return updated;
+    }
+
+    /* Keep the frame, title and separators untouched after initialization.
+     * Only the center result window is copied for each recognition event. */
+    src += ((P3_DYNAMIC_Y * P3_TEXT_BAND_W + P3_DYNAMIC_X) * 2u);
     return Lcd_UpdateRegionToBothBuffers(src,
-                                         P3_TEXT_BAND_X,
-                                         P3_TEXT_BAND_Y,
-                                         P3_TEXT_BAND_W,
-                                         P3_TEXT_BAND_H,
+                                         P3_TEXT_BAND_X + P3_DYNAMIC_X,
+                                         P3_TEXT_BAND_Y + P3_DYNAMIC_Y,
+                                         P3_DYNAMIC_W,
+                                         P3_DYNAMIC_H,
                                          row_bytes);
 }
 
@@ -942,6 +883,35 @@ static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float
             out_logmel[m * PROJECT3_MODEL_FRAMES + frame] = logf(mel_energy);
         }
     }
+
+    Project3_NormalizeLogMel(out_logmel);
+}
+
+static void Project3_NormalizeLogMel(float *logmel)
+{
+    int i;
+    double sum = 0.0;
+    double variance_sum = 0.0;
+    float mean;
+    float inv_std;
+
+    for (i = 0; i < PROJECT3_FEATURE_COUNT; i++) {
+        sum += (double)logmel[i];
+    }
+    mean = (float)(sum / (double)PROJECT3_FEATURE_COUNT);
+
+    for (i = 0; i < PROJECT3_FEATURE_COUNT; i++) {
+        double centered = (double)logmel[i] - (double)mean;
+        variance_sum += centered * centered;
+    }
+
+    inv_std = 1.0f /
+              (sqrtf((float)(variance_sum / (double)PROJECT3_FEATURE_COUNT)) +
+               PROJECT3_FEATURE_NORM_EPS);
+
+    for (i = 0; i < PROJECT3_FEATURE_COUNT; i++) {
+        logmel[i] = (logmel[i] - mean) * inv_std;
+    }
 }
 
 static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len)
@@ -966,12 +936,14 @@ static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len)
 static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy)
 {
     PROJECT3_VAD_STATE *vad = &ctx->vad;
-    const float smooth_alpha = 0.90f;
-    const float floor_rise_alpha = 0.995f;
+    const float smooth_alpha = 0.85f;
+    const float floor_rise_alpha = 0.95f;
     const float floor_fall_alpha = 0.92f;
     const float start_ratio = 4.5f;
     const float stop_ratio = 1.8f;
     const unsigned short start_frames = 4;
+    float start_threshold;
+    float stop_threshold;
 
     if (frame_energy < PROJECT3_VAD_MIN_FLOOR) {
         frame_energy = PROJECT3_VAD_MIN_FLOOR;
@@ -1000,14 +972,23 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
         }
     }
 
-    if (vad->smooth_energy > vad->noise_floor * start_ratio) {
+    start_threshold = vad->noise_floor * start_ratio;
+    if (start_threshold < PROJECT3_VAD_ABS_START_ENERGY) {
+        start_threshold = PROJECT3_VAD_ABS_START_ENERGY;
+    }
+    stop_threshold = vad->noise_floor * stop_ratio;
+    if (stop_threshold < PROJECT3_VAD_ABS_START_ENERGY * 0.45f) {
+        stop_threshold = PROJECT3_VAD_ABS_START_ENERGY * 0.45f;
+    }
+
+    if (vad->smooth_energy > start_threshold) {
         if (vad->speech_hold_frames < 255) vad->speech_hold_frames++;
     } else {
         vad->speech_hold_frames = 0;
     }
 
     if (vad->active) {
-        if (vad->smooth_energy < vad->noise_floor * stop_ratio) {
+        if (vad->smooth_energy < stop_threshold) {
             if (vad->silence_hold_frames < 255) vad->silence_hold_frames++;
         } else {
             vad->silence_hold_frames = 0;
@@ -1019,6 +1000,7 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
         vad->speech_hold_frames = 0;
         vad->silence_hold_frames = 0;
         Project3_SetAppState(ctx, PROJECT3_APP_SPEECH);
+        g_project3_vad_start_count++;
         return 1;
     }
 
@@ -1102,6 +1084,12 @@ static void Project3_AppendPreroll(PROJECT3_CONTEXT *ctx)
 static void Project3_CopyInputBlock(short *dst)
 {
     short *src = (AD_Ping_Pong == AD_BUFFER_PONG) ? AD_CH1_Buf0 : AD_CH1_Buf1;
+
+    /* EDMA writes the ADC ping-pong buffers without maintaining the DSP
+     * cache.  Invalidate before the CPU reads them or VAD can repeatedly see
+     * an old/zero cache line even though fresh audio has arrived. */
+    CacheInv((unsigned int)src,
+             sizeof(short) * PROJECT3_BLOCK_SAMPLES);
     memcpy(dst, src, sizeof(short) * PROJECT3_BLOCK_SAMPLES);
 }
 
@@ -1119,11 +1107,16 @@ static void Project3_FillDacOutput(const PROJECT3_CONTEXT *ctx, const short *src
 
 static void Project3_WriteOutputBlockToDac(const short *src)
 {
+    short *dst;
+
     if (DA_Ping_Pong == DA_BUFFER_PONG) {
-        memcpy(DA_CH1_Buf0, src, sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+        dst = DA_CH1_Buf0;
     } else {
-        memcpy(DA_CH1_Buf1, src, sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+        dst = DA_CH1_Buf1;
     }
+    memcpy(dst, src, sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+    CacheWB((unsigned int)dst,
+            sizeof(short) * PROJECT3_BLOCK_SAMPLES);
 }
 
 static void Project3_Conv2d(const float *in, float *out,
@@ -1352,32 +1345,29 @@ static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
     result.margin = best_prob - second_prob;
     result.valid = 1;
 
-    if (best == PROJECT3_CLASS_SILENCE || best == PROJECT3_CLASS_UNKNOWN) {
+    if (best == PROJECT3_CLASS_SILENCE) {
         result.valid = 0;
-    } else if ((best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD ||
-                result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) &&
-               (best_prob < PROJECT3_INFERENCE_SOFT_CONF ||
-                result.margin < PROJECT3_INFERENCE_SOFT_MARGIN)) {
+    } else if (best == PROJECT3_CLASS_UNKNOWN) {
+        /* Unknown is a real model output and is useful feedback to the user. */
+        result.valid = 1;
+    } else if (second == PROJECT3_CLASS_UNKNOWN &&
+               second_prob >= PROJECT3_UNKNOWN_COMPETITOR_THRESHOLD &&
+               best_prob < PROJECT3_UNKNOWN_COMMAND_OVERRIDE) {
+        /* A strong unknown runner-up means the model is unsure whether this
+         * audio belongs to the command vocabulary at all. */
+        result.valid = 0;
+    } else if (best_prob < PROJECT3_INFERENCE_CONF_THRESHOLD) {
+        result.valid = 0;
+    } else if (result.margin < PROJECT3_INFERENCE_MARGIN_THRESHOLD) {
         result.valid = 0;
     }
 
     return result;
 }
 
-static unsigned char Project3_AcceptResult(PROJECT3_INFER_RESULT *result, const PROJECT3_UTTERANCE_BUFFER *utter)
+static unsigned char Project3_AcceptResult(const PROJECT3_INFER_RESULT *result)
 {
-    if (!result->valid) {
-        return 0;
-    }
-
-    if (result->class_id == PROJECT3_CLASS_DOWN) {
-        if (utter->count > PROJECT3_DOWN_MAX_SAMPLES) {
-            result->valid = 0;
-            return 0;
-        }
-    }
-
-    return 1;
+    return result->valid ? 1u : 0u;
 }
 
 static unsigned char Project3_IsCommandClass(unsigned char class_id)
@@ -1433,10 +1423,31 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     PROJECT3_INFER_RESULT result;
     const char *label;
     unsigned char accepted;
+    unsigned long long infer_start;
+    unsigned long long infer_end;
+    unsigned long long infer_cycles;
 
-    Project3_SetAppState(ctx, PROJECT3_APP_SPEECH);
+    Project3_SetAppState(ctx, PROJECT3_APP_INFERENCING);
+    Project3_SetUiText(ctx, "Processing...", "", "");
+    Project3_UpdateUi(ctx, 1u);
 
+    g_project3_last_utterance_samples = ctx->utter.count;
+    g_project3_result_accepted = 0u;
+    infer_start = _itoll(TSCH, TSCL);
     result = Project3_RunInference(ctx, &ctx->utter);
+    infer_end = _itoll(TSCH, TSCL);
+    infer_cycles = infer_end - infer_start;
+    g_project3_last_inference_ms =
+        (unsigned long)(infer_cycles / (PROJECT3_DSP_CLOCK_HZ / 1000u));
+    g_project3_raw_top_class = result.class_id;
+    g_project3_raw_second_class = result.second_class_id;
+    g_project3_raw_top_permille =
+        (unsigned int)(result.confidence * 1000.0f + 0.5f);
+    g_project3_raw_second_permille =
+        (unsigned int)(result.second_confidence * 1000.0f + 0.5f);
+    g_project3_raw_margin_permille =
+        (unsigned int)(result.margin * 1000.0f + 0.5f);
+
     if (g_project3_memory_fault) {
         ctx->last_result = result;
         Project3_SetAppState(ctx, PROJECT3_APP_ERROR);
@@ -1446,17 +1457,24 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
         Project3_ResetUtterance(ctx);
         return;
     }
-    accepted = Project3_AcceptResult(&result, &ctx->utter);
+    accepted = Project3_AcceptResult(&result);
+    g_project3_result_accepted = accepted;
     ctx->input_gate_blocks = PROJECT3_POST_INFER_IGNORE_BLOCKS;
     Project3_ResetUtterance(ctx);
+    Project3_ResetPreroll();
 
     if (!accepted) {
-        /* Silence, explicit unknown, and low-confidence command guesses are
-         * not displayable in the first-stage LCD fix.  Keep the previous
-         * stable word on the LCD and avoid triggering a redraw. */
-        Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-        ctx->message_hold_blocks = 0;
-        ctx->message_return_to_listening = 0;
+        ctx->last_result = result;
+        if (result.class_id != PROJECT3_CLASS_SILENCE) {
+            /* A low-confidence command is presented as unknown instead of
+             * leaving the user with an apparently frozen Listening screen. */
+            Project3_CommitStableWord(ctx, "unknown");
+            ctx->message_hold_blocks = PROJECT3_RESULT_HOLD_BLOCKS;
+            ctx->message_return_to_listening = 1u;
+        } else {
+            Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+            Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+        }
         return;
     }
 
@@ -1464,8 +1482,8 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     label = Project3_GetLabel(result.class_id);
     Project3_CommitStableWord(ctx, label);
     ctx->recognized_count++;
-    ctx->message_hold_blocks = 0;
-    ctx->message_return_to_listening = 0;
+    ctx->message_hold_blocks = PROJECT3_RESULT_HOLD_BLOCKS;
+    ctx->message_return_to_listening = 1u;
 }
 
 #if 0
@@ -1537,6 +1555,10 @@ static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char 
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
 {
+    /* Writing TSCL starts the free-running C674x cycle counter used for
+     * non-intrusive inference timing. */
+    TSCL = 0;
+    TSCH = 0;
     memset(ctx, 0, sizeof(PROJECT3_CONTEXT));
     ctx->pass_through_enable = PROJECT3_PASS_THROUGH_ENABLE;
     ctx->model_state = PROJECT3_MODEL_READY;
@@ -1560,6 +1582,7 @@ static void Project3_InitUi(PROJECT3_CONTEXT *ctx)
 
     // 防重入标志初始化
     s_lcd_busy = 0;
+    s_lcd_layout_ready = 0u;
 
     // 全屏清屏一次（只在初始化时）- 使用固定布局宏
 
@@ -1644,8 +1667,19 @@ static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx)
 static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsigned int block_samples)
 {
     unsigned int offset;
+    unsigned int i;
     unsigned char block_has_speech = 0;
     unsigned char end_pending = 0;
+    int peak = 0;
+
+    g_project3_audio_block_count++;
+    for (i = 0u; i < block_samples; i++) {
+        int sample = (int)block[i];
+        if (sample < 0) sample = -sample;
+        if (sample > peak) peak = sample;
+    }
+    if (peak > 32767) peak = 32767;
+    g_project3_audio_peak = (short)peak;
 
     Project3_ServiceErrorHold(ctx);
     Project3_ServiceMessageHold(ctx);
@@ -1667,6 +1701,10 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
         float frame_energy = Project3_ComputeFrameEnergy(&block[offset], PROJECT3_VAD_FRAME_LEN);
         unsigned char started = Project3_UpdateVad(ctx, frame_energy);
 
+        g_project3_last_frame_energy = frame_energy;
+        g_project3_vad_noise_floor = ctx->vad.noise_floor;
+        g_project3_vad_smooth_energy = ctx->vad.smooth_energy;
+
         ctx->frame_counter++;
 
         if (started) {
@@ -1687,12 +1725,16 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
 
     if (block_has_speech) {
         Project3_AppendRawBlock(ctx, block, block_samples);
+        ctx->active_speech_samples += block_samples;
+        g_project3_current_utterance_samples = ctx->utter.count;
     } else {
         Project3_UpdatePreroll(block, block_samples);
     }
 
     if (end_pending || ctx->utter.count >= PROJECT3_RAW_MAX_SAMPLES) {
-        if (ctx->utter.count >= PROJECT3_MIN_UTTERANCE_SAMPLES) {
+        g_project3_vad_end_count++;
+        if (ctx->utter.count >= PROJECT3_MIN_UTTERANCE_SAMPLES &&
+            ctx->active_speech_samples >= PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES) {
             Project3_HandleSpeechEnd(ctx);
         } else {
             Project3_ResetUtterance(ctx);
@@ -1747,6 +1789,8 @@ static void Project3_ResetUtterance(PROJECT3_CONTEXT *ctx)
     ctx->vad.active = 0;
     ctx->vad.speech_hold_frames = 0;
     ctx->vad.silence_hold_frames = 0;
+    ctx->active_speech_samples = 0u;
+    g_project3_current_utterance_samples = 0u;
 }
 
 static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx)
@@ -1754,8 +1798,15 @@ static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx)
     if (ctx->message_hold_blocks > 0) {
         ctx->message_hold_blocks--;
         if (ctx->message_hold_blocks == 0) {
-            ctx->message_return_to_listening = 0;
-            Project3_RestoreStableDisplay(ctx);
+            if (ctx->message_return_to_listening) {
+                ctx->message_return_to_listening = 0u;
+                ctx->input_gate_blocks = 0u;
+                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+                Project3_ResetPreroll();
+            } else {
+                Project3_RestoreStableDisplay(ctx);
+            }
         }
     }
 }

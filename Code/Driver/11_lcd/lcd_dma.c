@@ -1,13 +1,18 @@
 /**
  * @file lcd_dma.c
- * @brief LCD DMA double-framebuffer configuration.
+ * @brief LCD DMA single-scan framebuffer with software-managed back buffer.
  */
 
 #include "lcd_dma.h"
+#include "lcd_ctrl.h"
+#include "lcd_raster.h"
 #include "soc_C6748.h"
 #include "raster.h"
+#include "psc.h"
 #include "dspcache.h"
 #include "delay.h"
+#include "hw_types.h"
+#include "hw_syscfg0_C6748.h"
 #include <string.h>
 
 #pragma DATA_SECTION(Lcd_Buffer, "offscreen_buffer")
@@ -24,7 +29,11 @@ volatile unsigned long lcd_fifo_underflow_count = 0u;
 volatile unsigned long lcd_sync_lost_count = 0u;
 volatile unsigned long lcd_recovery_count = 0u;
 
-static unsigned int s_lcd_consecutive_faults = 0u;
+static unsigned char *s_lcd_front_buffer = Lcd_Buffer;
+static unsigned char *s_lcd_draw_buffer = Lcd_BackBuffer;
+
+#define LCD_EOF_TIMEOUT_MS       25u
+#define LCDC_MASTER_PRIORITY     0u
 
 static unsigned short palette_32b[PALETTE_SIZE / 2] = {
     0x4000u, 0x0000u, 0x0000u, 0x0000u,
@@ -64,32 +73,20 @@ static void Lcd_RecordEofStatus(unsigned int status)
     }
 }
 
-static unsigned char Lcd_WaitForFrameDone(unsigned int frame)
+static void Lcd_SetRealtimeMasterPriority(void)
 {
-    unsigned int status;
-    unsigned int mask;
+    unsigned int priority;
 
-    mask = (frame == LCD_FRAME_0) ? RASTER_END_OF_FRAME0_INT_STAT :
-                                    RASTER_END_OF_FRAME1_INT_STAT;
+    HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_KICK0R) = SYSCFG_KICK0R_UNLOCK;
+    HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_KICK1R) = SYSCFG_KICK1R_UNLOCK;
 
-    status = RasterIntStatus(SOC_LCDC_0_REGS, mask);
-    if (status != 0u) {
-        RasterClearGetIntStatus(SOC_LCDC_0_REGS, status & mask);
-    }
+    priority = HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_MSTPRI2);
+    priority &= ~SYSCFG_MSTPRI2_LCDC;
+    priority |= (LCDC_MASTER_PRIORITY << SYSCFG_MSTPRI2_LCDC_SHIFT);
+    HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_MSTPRI2) = priority;
 
-    SysStartTimer(25u);
-    while (!SysIsTimerElapsed()) {
-        status = RasterIntStatus(SOC_LCDC_0_REGS, mask);
-        if (status != 0u) {
-            RasterClearGetIntStatus(SOC_LCDC_0_REGS, status & mask);
-            Lcd_RecordEofStatus(status & mask);
-            SysStopTimer();
-            return 1u;
-        }
-    }
-
-    SysStopTimer();
-    return 0u;
+    HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_KICK0R) = SYSCFG_KICK0R_KICK0;
+    HWREG(SOC_SYSCFG_0_REGS + SYSCFG0_KICK1R) = SYSCFG_KICK1R_KICK1;
 }
 
 static void Lcd_CopyRegionToBuffer(unsigned char *buffer,
@@ -128,7 +125,7 @@ unsigned char Lcd_WaitForEndOfFrame(void)
         RasterClearGetIntStatus(SOC_LCDC_0_REGS, status & eof_mask);
     }
 
-    SysStartTimer(25u);
+    SysStartTimer(LCD_EOF_TIMEOUT_MS);
     while (!SysIsTimerElapsed()) {
         status = RasterIntStatus(SOC_LCDC_0_REGS, eof_mask);
         if (status != 0u) {
@@ -169,7 +166,7 @@ unsigned int Lcd_GetRasterFaultStatus(void)
 
 unsigned char *Lcd_GetDrawBuffer(void)
 {
-    return Lcd_BackBuffer;
+    return s_lcd_draw_buffer;
 }
 
 void Lcd_RecoverRasterDma(void)
@@ -178,19 +175,27 @@ void Lcd_RecoverRasterDma(void)
 
     RasterDisable(SOC_LCDC_0_REGS);
 
-    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_DOUBLE_FRAME_BUFFER,
+    /* OMAP-L138/C6748 erratum 2.1.3 requires an LCDC module reset after FIFO
+     * underflow.  A raster disable/enable alone does not reset the damaged
+     * controller state. */
+    PSCModuleControl(SOC_PSC_1_REGS, HW_PSC_LCDC,
+                     PSC_POWERDOMAIN_ALWAYS_ON, PSC_MDCTL_NEXT_DISABLE);
+    PSCModuleControl(SOC_PSC_1_REGS, HW_PSC_LCDC,
+                     PSC_POWERDOMAIN_ALWAYS_ON, PSC_MDCTL_NEXT_ENABLE);
+
+    Lcd_SetRealtimeMasterPriority();
+    Lcd_CTRL_Init();
+    Lcd_Raster_Init();
+
+    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_SINGLE_FRAME_BUFFER,
                     RASTER_BURST_SIZE_16, RASTER_FIFO_THRESHOLD_256,
                     RASTER_BIG_ENDIAN_DISABLE);
 
     RasterEndOfFrameIntEnable(SOC_LCDC_0_REGS);
     RasterDMAFBConfig(SOC_LCDC_0_REGS,
-                      (unsigned int)(Lcd_Buffer + PALETTE_OFFSET),
-                      (unsigned int)(Lcd_Buffer + LCD_BUFFER_BYTES - 2),
+                      (unsigned int)(s_lcd_front_buffer + PALETTE_OFFSET),
+                      (unsigned int)(s_lcd_front_buffer + LCD_BUFFER_BYTES - 2),
                       LCD_FRAME_0);
-    RasterDMAFBConfig(SOC_LCDC_0_REGS,
-                      (unsigned int)(Lcd_BackBuffer + PALETTE_OFFSET),
-                      (unsigned int)(Lcd_BackBuffer + LCD_BUFFER_BYTES - 2),
-                      LCD_FRAME_1);
     (void)Lcd_GetRasterFaultStatus();
     RasterEnable(SOC_LCDC_0_REGS);
 }
@@ -200,23 +205,17 @@ void Lcd_ServiceRasterHealth(void)
     unsigned int fault = Lcd_GetRasterFaultStatus();
 
     if (fault == 0u) {
-        s_lcd_consecutive_faults = 0u;
         return;
     }
 
-    s_lcd_consecutive_faults++;
-    if (s_lcd_consecutive_faults >= 3u) {
-        s_lcd_consecutive_faults = 0u;
-        Lcd_RecoverRasterDma();
-    }
+    Lcd_RecoverRasterDma();
 }
 
 unsigned char Lcd_SwapFrameBuffers(void)
 {
-    /*
-     * In true double-buffer mode LCDC alternates FB0/FB1 by itself.  Runtime
-     * framebuffer-address hot swapping is intentionally disabled.
-     */
+    /* The LCDC remains bound to one stable framebuffer.  Runtime writes to
+     * LCDDMA_FB0_BASE are avoided because the new address is not guaranteed
+     * to be latched at the EOF where software writes it. */
     return Lcd_WaitForEndOfFrame();
 }
 
@@ -236,30 +235,37 @@ unsigned char Lcd_UpdateRegionToBothBuffers(const unsigned char *src,
         return 0u;
     }
 
-    /*
-     * EOF0 means FB0 has just finished scanning and LCDC is moving to FB1.
-     * Update FB0 there; then wait for EOF1 and update FB1.  After this returns,
-     * both framebuffers contain the same complete text image.
-     */
-    if (!Lcd_WaitForFrameDone(LCD_FRAME_0)) {
-        return 0u;
-    }
-    Lcd_CopyRegionToBuffer(Lcd_Buffer, src, x, y, width, height, src_row_bytes);
+    /* Prepare the same region in the software backup first. */
+    Lcd_CopyRegionToBuffer(s_lcd_draw_buffer, src, x, y,
+                           width, height, src_row_bytes);
 
-    if (!Lcd_WaitForFrameDone(LCD_FRAME_1)) {
+    /* FB0 remains fixed for the lifetime of the display.  Copy immediately
+     * after EOF so the update finishes well before raster reaches the center
+     * result band.  This avoids both ping-pong flashing and address-latch
+     * ambiguity. */
+    if (!Lcd_WaitForEndOfFrame()) {
         return 0u;
     }
-    Lcd_CopyRegionToBuffer(Lcd_BackBuffer, src, x, y, width, height, src_row_bytes);
+    Lcd_CopyRegionToBuffer(s_lcd_front_buffer, src, x, y,
+                           width, height, src_row_bytes);
 
     return 1u;
 }
 
 void Lcd_DMA_Init(void)
 {
+    /* The LCDC is not cache coherent with the C674x.  Keep the dedicated
+     * C6000000 framebuffer MAR uncached so display memory never contains
+     * CPU-only dirty cache lines.  Model weights remain in cached C0000000-
+     * C5FFFFFF DDR and inference performance is unaffected. */
+    CacheDisableMAR((unsigned int)Lcd_Buffer,
+                    LCD_BUFFER_BYTES * 2u);
     Lcd_ClearFrameBuffer();
-    s_lcd_consecutive_faults = 0u;
+    s_lcd_front_buffer = Lcd_Buffer;
+    s_lcd_draw_buffer = Lcd_BackBuffer;
+    Lcd_SetRealtimeMasterPriority();
 
-    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_DOUBLE_FRAME_BUFFER,
+    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_SINGLE_FRAME_BUFFER,
                     RASTER_BURST_SIZE_16, RASTER_FIFO_THRESHOLD_256,
                     RASTER_BIG_ENDIAN_DISABLE);
 
@@ -269,8 +275,4 @@ void Lcd_DMA_Init(void)
                       (unsigned int)(Lcd_Buffer + PALETTE_OFFSET),
                       (unsigned int)(Lcd_Buffer + LCD_BUFFER_BYTES - 2),
                       LCD_FRAME_0);
-    RasterDMAFBConfig(SOC_LCDC_0_REGS,
-                      (unsigned int)(Lcd_BackBuffer + PALETTE_OFFSET),
-                      (unsigned int)(Lcd_BackBuffer + LCD_BUFFER_BYTES - 2),
-                      LCD_FRAME_1);
 }
