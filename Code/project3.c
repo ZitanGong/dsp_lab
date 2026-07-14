@@ -8,7 +8,9 @@ int main(void)
     Project3_InitContext(&ctx);
 
     Sys_Init();
+#if PROJECT3_ENABLE_KEY_CONTROLS
     Key_Init();
+#endif
     Touch_Init();
     Project3_InitUi(&ctx);
 

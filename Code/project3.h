@@ -66,11 +66,11 @@
 #define PROJECT3_DSP_CLOCK_HZ               456000000u
 
 /* One command is normalized to the same 1-second waveform used by train_bcresnet.py. */
-#define PROJECT3_RAW_MAX_SAMPLES            PROJECT3_HW_SAMPLE_RATE
+#define PROJECT3_RAW_MAX_SAMPLES            (PROJECT3_HW_SAMPLE_RATE * 13 / 10)
 #define PROJECT3_MODEL_SAMPLES              16000
 #define PROJECT3_VAD_FRAME_LEN              400
 #define PROJECT3_VAD_HOP                    200
-#define PROJECT3_PREROLL_SAMPLES            (PROJECT3_HW_SAMPLE_RATE / 20)
+#define PROJECT3_PREROLL_SAMPLES            (PROJECT3_HW_SAMPLE_RATE / 10)
 #define PROJECT3_WIN_SIZE                   480
 #define PROJECT3_HOP_SIZE                   160
 #define PROJECT3_FFT_LEN                    512
@@ -83,6 +83,7 @@
 #define PROJECT3_UI_TEXT_LEN                64
 #define PROJECT3_RESULT_TEXT_LEN            32
 #define PROJECT3_PASS_THROUGH_ENABLE        0
+#define PROJECT3_ENABLE_KEY_CONTROLS        0
 #define PROJECT3_INFERENCE_CONF_THRESHOLD     0.55f
 #define PROJECT3_INFERENCE_MARGIN_THRESHOLD   0.12f
 #define PROJECT3_UNKNOWN_COMPETITOR_THRESHOLD 0.25f
@@ -93,14 +94,27 @@
 #define PROJECT3_WAVE_PEAK_LIMIT            0.98f
 #define PROJECT3_WAVE_MIN_RMS               1.0e-5f
 #define PROJECT3_MIN_UTTERANCE_SAMPLES      (PROJECT3_HW_SAMPLE_RATE / 5)
-#define PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES  (PROJECT3_HW_SAMPLE_RATE / 8)
+#define PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES  (PROJECT3_HW_SAMPLE_RATE * 11 / 50)
 #define PROJECT3_VAD_ABS_START_ENERGY       2.5e-6f
 #define PROJECT3_POST_INFER_IGNORE_BLOCKS   20
 #define PROJECT3_MESSAGE_HOLD_BLOCKS        20
-#define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE * 3 / PROJECT3_BLOCK_SAMPLES) + 1)
+#define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE / PROJECT3_BLOCK_SAMPLES) + 1)
 #define PROJECT3_ERROR_HOLD_BLOCKS          50
 #define PROJECT3_VAD_CALIB_FRAMES           40
 #define PROJECT3_VAD_MIN_FLOOR              1.0e-8f
+#define PROJECT3_VAD_BAND_COUNT              5u
+#define PROJECT3_VAD_BAND_FLOOR              1.0e-10f
+#define PROJECT3_VAD_BAND_SMOOTH_ALPHA       0.80f
+#define PROJECT3_VAD_ACTIVE_BAND_RATIO       2.00f
+#define PROJECT3_VAD_LOW_DOMINANCE_LIMIT     0.76f
+#define PROJECT3_SPEECH_CHECK_FRAME_LEN      400u
+#define PROJECT3_SPEECH_CHECK_HOP            200u
+#define PROJECT3_SPEECH_PITCH_LAG_MIN        63u
+#define PROJECT3_SPEECH_PITCH_LAG_MAX        250u
+#define PROJECT3_SPEECH_PITCH_LAG_STEP       5u
+#define PROJECT3_SPEECH_PERIODICITY_SQ       0.0784f
+#define PROJECT3_SPEECH_REQUIRED_FRAMES      2u
+#define PROJECT3_NONSPEECH_IGNORE_BLOCKS     4u
 
 #define PROJECT3_CENTER_X                   400
 #define PROJECT3_CENTER_Y                   215
@@ -144,11 +158,23 @@ typedef enum {
 } PROJECT3_CLASS_ID;
 
 typedef struct {
+    float total_energy;
+    float band_energy[PROJECT3_VAD_BAND_COUNT];
+    float low_fraction;
+} PROJECT3_VAD_FEATURES;
+
+typedef struct {
     float noise_floor;
     float smooth_energy;
+    float band_noise[PROJECT3_VAD_BAND_COUNT];
+    float band_smooth[PROJECT3_VAD_BAND_COUNT];
+    float band_deviation[PROJECT3_VAD_BAND_COUNT];
+    float speech_score;
+    float low_fraction;
     unsigned short speech_hold_frames;
     unsigned short silence_hold_frames;
     unsigned short calibrate_frames;
+    unsigned char active_bands;
     unsigned char active;
 } PROJECT3_VAD_STATE;
 
@@ -313,6 +339,13 @@ volatile unsigned char g_project3_result_accepted = 0u;
 volatile unsigned int g_project3_raw_top_permille = 0u;
 volatile unsigned int g_project3_raw_second_permille = 0u;
 volatile unsigned int g_project3_raw_margin_permille = 0u;
+volatile unsigned long g_project3_nonspeech_reject_count = 0u;
+volatile unsigned int g_project3_last_voiced_frame_count = 0u;
+volatile unsigned int g_project3_last_periodicity_permille = 0u;
+volatile unsigned int g_project3_vad_speech_score_permille = 0u;
+volatile unsigned int g_project3_vad_low_fraction_permille = 0u;
+volatile unsigned int g_project3_vad_active_band_count = 0u;
+volatile unsigned int g_project3_vad_band_ratio_permille[PROJECT3_VAD_BAND_COUNT] = {0u, 0u, 0u, 0u, 0u};
 
 extern unsigned char Lcd_Buffer[];
 
@@ -333,7 +366,13 @@ static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float
 static void Project3_NormalizeLogMel(float *logmel);
 static void Project3_FormatRawResult(const PROJECT3_INFER_RESULT *result, char *text, unsigned int text_len);
 static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len);
-static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy);
+static void Project3_ComputeVadFeatures(const short *frame, unsigned int len,
+                                        PROJECT3_VAD_FEATURES *features);
+static void Project3_ResetVadAdaptiveState(PROJECT3_VAD_STATE *vad);
+static unsigned char Project3_IsSpeechLikeUtterance(const PROJECT3_CONTEXT *ctx,
+                                                     const PROJECT3_UTTERANCE_BUFFER *utter);
+static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx,
+                                        const PROJECT3_VAD_FEATURES *features);
 static unsigned char Project3_ShouldEndUtterance(PROJECT3_CONTEXT *ctx);
 static void Project3_AppendRawBlock(PROJECT3_CONTEXT *ctx, const short *block, unsigned int block_samples);
 static void Project3_UpdatePreroll(const short *block, unsigned int block_samples);
@@ -803,6 +842,9 @@ static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter)
     float rms;
     float gain;
     float peak = 0.0f;
+    unsigned char compress_long_utterance;
+    float source_position = 0.0f;
+    float source_step = 0.0f;
 
     if (utter->count > 0u) {
         unsigned int i;
@@ -812,12 +854,28 @@ static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter)
         mean /= (double)utter->count;
     }
 
+    compress_long_utterance =
+        (utter->count > PROJECT3_HW_SAMPLE_RATE) ? 1u : 0u;
+    if (compress_long_utterance) {
+        source_step = (float)(utter->count - 1u) /
+                      (float)(PROJECT3_MODEL_SAMPLES - 1);
+    }
+
     for (n = 0; n < PROJECT3_MODEL_SAMPLES; n++) {
-        int q = n * 5;
-        int base = q >> 2;
-        int rem = q & 3;
-        float frac = (float)rem * 0.25f;
+        int base;
+        float frac;
         float sample = (float)mean;
+
+        if (compress_long_utterance) {
+            base = (int)source_position;
+            frac = source_position - (float)base;
+            source_position += source_step;
+        } else {
+            int q = n * 5;
+            int rem = q & 3;
+            base = q >> 2;
+            frac = (float)rem * 0.25f;
+        }
 
         if ((unsigned int)(base + 1) < utter->count) {
             sample = (1.0f - frac) * (float)utter->raw[base] + frac * (float)utter->raw[base + 1];
@@ -933,7 +991,220 @@ static float Project3_ComputeFrameEnergy(const short *frame, unsigned int len)
     return energy / (float)len;
 }
 
-static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energy)
+static void Project3_ComputeVadFeatures(const short *frame, unsigned int len,
+                                        PROJECT3_VAD_FEATURES *features)
+{
+    /* Four one-pole low-pass sections form five coarse, overlapping bands.
+     * The coefficients are fixed by the 20 kHz sampling rate, while every
+     * decision threshold is relative to the independently learned noise
+     * energy in each band.  Local filter state makes this routine safe for
+     * the overlapping 400-sample VAD frames. */
+    const float alpha0 = 0.0755356f;  /* approximately 0..250 Hz */
+    const float alpha1 = 0.1974812f;  /* approximately 250..700 Hz */
+    const float alpha2 = 0.3950774f;  /* approximately 700..1600 Hz */
+    const float alpha3 = 0.6340697f;  /* approximately 1600..3200 Hz */
+    float lp0 = 0.0f;
+    float lp1 = 0.0f;
+    float lp2 = 0.0f;
+    float lp3 = 0.0f;
+    float mean = 0.0f;
+    float band_sum = 0.0f;
+    unsigned int i;
+    unsigned int b;
+
+    features->total_energy = 0.0f;
+    features->low_fraction = 0.0f;
+    for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+        features->band_energy[b] = 0.0f;
+    }
+
+    if (len == 0u) {
+        return;
+    }
+
+    for (i = 0u; i < len; i++) {
+        mean += (float)frame[i];
+    }
+    mean /= (float)len;
+
+    for (i = 0u; i < len; i++) {
+        float x = ((float)frame[i] - mean) / 32768.0f;
+        float band0;
+        float band1;
+        float band2;
+        float band3;
+        float band4;
+
+        lp0 += alpha0 * (x - lp0);
+        lp1 += alpha1 * (x - lp1);
+        lp2 += alpha2 * (x - lp2);
+        lp3 += alpha3 * (x - lp3);
+
+        band0 = lp0;
+        band1 = lp1 - lp0;
+        band2 = lp2 - lp1;
+        band3 = lp3 - lp2;
+        band4 = x - lp3;
+
+        features->total_energy += x * x;
+        features->band_energy[0] += band0 * band0;
+        features->band_energy[1] += band1 * band1;
+        features->band_energy[2] += band2 * band2;
+        features->band_energy[3] += band3 * band3;
+        features->band_energy[4] += band4 * band4;
+    }
+
+    features->total_energy /= (float)len;
+    for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+        features->band_energy[b] /= (float)len;
+        if (features->band_energy[b] < PROJECT3_VAD_BAND_FLOOR) {
+            features->band_energy[b] = PROJECT3_VAD_BAND_FLOOR;
+        }
+        band_sum += features->band_energy[b];
+    }
+    if (band_sum > PROJECT3_VAD_BAND_FLOOR) {
+        features->low_fraction = features->band_energy[0] / band_sum;
+    }
+}
+
+static void Project3_ResetVadAdaptiveState(PROJECT3_VAD_STATE *vad)
+{
+    unsigned int b;
+
+    vad->noise_floor = PROJECT3_VAD_MIN_FLOOR;
+    vad->smooth_energy = PROJECT3_VAD_MIN_FLOOR;
+    vad->speech_score = 0.0f;
+    vad->low_fraction = 0.0f;
+    vad->speech_hold_frames = 0u;
+    vad->silence_hold_frames = 0u;
+    vad->calibrate_frames = 0u;
+    vad->active_bands = 0u;
+    vad->active = 0u;
+    for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+        vad->band_noise[b] = PROJECT3_VAD_BAND_FLOOR;
+        vad->band_smooth[b] = PROJECT3_VAD_BAND_FLOOR;
+        vad->band_deviation[b] = PROJECT3_VAD_BAND_FLOOR;
+        g_project3_vad_band_ratio_permille[b] = 0u;
+    }
+    g_project3_vad_speech_score_permille = 0u;
+    g_project3_vad_low_fraction_permille = 0u;
+    g_project3_vad_active_band_count = 0u;
+}
+
+static unsigned char Project3_IsSpeechLikeUtterance(const PROJECT3_CONTEXT *ctx,
+                                                     const PROJECT3_UTTERANCE_BUFFER *utter)
+{
+    unsigned int offset;
+    unsigned int voiced_frames = 0u;
+    unsigned int spectral_frames = 0u;
+    unsigned int spectral_voiced_frames = 0u;
+    float max_periodicity_sq = 0.0f;
+    float min_frame_energy = ctx->vad.noise_floor * 2.0f;
+
+    if (min_frame_energy < PROJECT3_VAD_ABS_START_ENERGY * 0.60f) {
+        min_frame_energy = PROJECT3_VAD_ABS_START_ENERGY * 0.60f;
+    }
+
+    for (offset = 0u;
+         offset + PROJECT3_SPEECH_CHECK_FRAME_LEN <= utter->count;
+         offset += PROJECT3_SPEECH_CHECK_HOP) {
+        const short *frame = &utter->raw[offset];
+        PROJECT3_VAD_FEATURES features;
+        float frame_energy;
+        float mean = 0.0f;
+        float best_score_sq = 0.0f;
+        unsigned int active_bands = 0u;
+        unsigned char spectral_like;
+        unsigned int i;
+        unsigned int lag;
+        unsigned int b;
+
+        Project3_ComputeVadFeatures(frame, PROJECT3_SPEECH_CHECK_FRAME_LEN,
+                                    &features);
+        frame_energy = features.total_energy;
+
+        if (frame_energy < min_frame_energy) {
+            continue;
+        }
+
+        for (b = 1u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+            float baseline = ctx->vad.band_noise[b];
+            if (baseline < PROJECT3_VAD_BAND_FLOOR) {
+                baseline = PROJECT3_VAD_BAND_FLOOR;
+            }
+            if (features.band_energy[b] >= baseline * 1.60f) {
+                active_bands++;
+            }
+        }
+        spectral_like =
+            (active_bands >= 2u &&
+             features.low_fraction < PROJECT3_VAD_LOW_DOMINANCE_LIMIT + 0.08f)
+                ? 1u : 0u;
+        if (spectral_like) {
+            spectral_frames++;
+        }
+
+        for (i = 0u; i < PROJECT3_SPEECH_CHECK_FRAME_LEN; i++) {
+            mean += (float)frame[i];
+        }
+        mean /= (float)PROJECT3_SPEECH_CHECK_FRAME_LEN;
+
+        for (lag = PROJECT3_SPEECH_PITCH_LAG_MIN;
+             lag <= PROJECT3_SPEECH_PITCH_LAG_MAX;
+             lag += PROJECT3_SPEECH_PITCH_LAG_STEP) {
+            float correlation = 0.0f;
+            float energy_a = 0.0f;
+            float energy_b = 0.0f;
+            float score_sq;
+            unsigned int limit = PROJECT3_SPEECH_CHECK_FRAME_LEN - lag;
+
+            /* Every other sample is sufficient for the gate and halves the
+             * cost.  Compare squared normalized correlation to avoid sqrtf
+             * in the inner loop. */
+            for (i = 0u; i < limit; i += 2u) {
+                float a = (float)frame[i] - mean;
+                float b = (float)frame[i + lag] - mean;
+                correlation += a * b;
+                energy_a += a * a;
+                energy_b += b * b;
+            }
+
+            if (correlation <= 0.0f || energy_a <= 1.0f || energy_b <= 1.0f) {
+                continue;
+            }
+            score_sq = (correlation * correlation) / (energy_a * energy_b);
+            if (score_sq > best_score_sq) {
+                best_score_sq = score_sq;
+            }
+        }
+
+        if (best_score_sq > max_periodicity_sq) {
+            max_periodicity_sq = best_score_sq;
+        }
+        if (best_score_sq >= PROJECT3_SPEECH_PERIODICITY_SQ) {
+            voiced_frames++;
+            if (spectral_like) {
+                spectral_voiced_frames++;
+            }
+            if (spectral_voiced_frames >= PROJECT3_SPEECH_REQUIRED_FRAMES &&
+                spectral_frames >= PROJECT3_SPEECH_REQUIRED_FRAMES) {
+                break;
+            }
+        }
+    }
+
+    g_project3_last_voiced_frame_count = voiced_frames;
+    g_project3_last_periodicity_permille =
+        (unsigned int)(sqrtf(max_periodicity_sq) * 1000.0f + 0.5f);
+    if (g_project3_last_periodicity_permille > 1000u) {
+        g_project3_last_periodicity_permille = 1000u;
+    }
+    return (spectral_voiced_frames >= PROJECT3_SPEECH_REQUIRED_FRAMES &&
+            spectral_frames >= PROJECT3_SPEECH_REQUIRED_FRAMES) ? 1u : 0u;
+}
+
+static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx,
+                                        const PROJECT3_VAD_FEATURES *features)
 {
     PROJECT3_VAD_STATE *vad = &ctx->vad;
     const float smooth_alpha = 0.85f;
@@ -941,34 +1212,83 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
     const float floor_fall_alpha = 0.92f;
     const float start_ratio = 4.5f;
     const float stop_ratio = 1.8f;
-    const unsigned short start_frames = 4;
+    const unsigned short start_frames = 5u;
+    const float score_weights[PROJECT3_VAD_BAND_COUNT] = {
+        0.0f, 1.0f, 1.0f, 0.85f, 0.65f
+    };
+    float frame_energy = features->total_energy;
     float start_threshold;
     float stop_threshold;
+    float speech_score = 0.0f;
+    float band_sum = 0.0f;
+    float low_fraction;
+    unsigned int active_bands = 0u;
+    unsigned int b;
 
     if (frame_energy < PROJECT3_VAD_MIN_FLOOR) {
         frame_energy = PROJECT3_VAD_MIN_FLOOR;
     }
 
     vad->smooth_energy = smooth_alpha * vad->smooth_energy + (1.0f - smooth_alpha) * frame_energy;
+    for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+        vad->band_smooth[b] =
+            PROJECT3_VAD_BAND_SMOOTH_ALPHA * vad->band_smooth[b] +
+            (1.0f - PROJECT3_VAD_BAND_SMOOTH_ALPHA) * features->band_energy[b];
+    }
 
     if (vad->calibrate_frames < PROJECT3_VAD_CALIB_FRAMES) {
         float cal_alpha = (vad->calibrate_frames == 0u) ? 0.0f : 0.70f;
         vad->noise_floor = cal_alpha * vad->noise_floor + (1.0f - cal_alpha) * frame_energy;
         vad->smooth_energy = vad->noise_floor;
+        for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+            float previous = vad->band_noise[b];
+            float sample = features->band_energy[b];
+            float delta;
+            vad->band_noise[b] = cal_alpha * previous + (1.0f - cal_alpha) * sample;
+            delta = fabsf(sample - vad->band_noise[b]);
+            vad->band_deviation[b] =
+                cal_alpha * vad->band_deviation[b] + (1.0f - cal_alpha) * delta;
+            if (vad->band_deviation[b] < PROJECT3_VAD_BAND_FLOOR) {
+                vad->band_deviation[b] = PROJECT3_VAD_BAND_FLOOR;
+            }
+            vad->band_smooth[b] = vad->band_noise[b];
+        }
         vad->calibrate_frames++;
         vad->speech_hold_frames = 0;
         vad->silence_hold_frames = 0;
         return 0;
     }
 
+    /* Restore the proven scalar adaptive trigger.  The band model is updated
+     * and exposed for the post-capture breath veto, but it has no authority
+     * to start or prolong an utterance. */
     if (!vad->active) {
         if (vad->smooth_energy > vad->noise_floor) {
-            vad->noise_floor = floor_rise_alpha * vad->noise_floor + (1.0f - floor_rise_alpha) * vad->smooth_energy;
+            vad->noise_floor = floor_rise_alpha * vad->noise_floor +
+                (1.0f - floor_rise_alpha) * vad->smooth_energy;
         } else {
-            vad->noise_floor = floor_fall_alpha * vad->noise_floor + (1.0f - floor_fall_alpha) * vad->smooth_energy;
+            vad->noise_floor = floor_fall_alpha * vad->noise_floor +
+                (1.0f - floor_fall_alpha) * vad->smooth_energy;
         }
         if (vad->noise_floor < PROJECT3_VAD_MIN_FLOOR) {
             vad->noise_floor = PROJECT3_VAD_MIN_FLOOR;
+        }
+
+        for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+            float alpha = (vad->band_smooth[b] > vad->band_noise[b])
+                ? floor_rise_alpha : floor_fall_alpha;
+            float new_noise = alpha * vad->band_noise[b] +
+                (1.0f - alpha) * vad->band_smooth[b];
+            float deviation = fabsf(vad->band_smooth[b] - new_noise);
+            vad->band_noise[b] = new_noise;
+            vad->band_deviation[b] = alpha * vad->band_deviation[b] +
+                (1.0f - alpha) * deviation;
+            if (vad->band_noise[b] < PROJECT3_VAD_BAND_FLOOR) {
+                vad->band_noise[b] = PROJECT3_VAD_BAND_FLOOR;
+            }
+            if (vad->band_deviation[b] < PROJECT3_VAD_BAND_FLOOR) {
+                vad->band_deviation[b] = PROJECT3_VAD_BAND_FLOOR;
+            }
         }
     }
 
@@ -980,6 +1300,48 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
     if (stop_threshold < PROJECT3_VAD_ABS_START_ENERGY * 0.45f) {
         stop_threshold = PROJECT3_VAD_ABS_START_ENERGY * 0.45f;
     }
+
+    for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+        float baseline = vad->band_noise[b];
+        float ratio;
+        unsigned int ratio_permille;
+        if (baseline < PROJECT3_VAD_BAND_FLOOR) {
+            baseline = PROJECT3_VAD_BAND_FLOOR;
+        }
+        ratio = vad->band_smooth[b] / baseline;
+        band_sum += vad->band_smooth[b];
+        ratio_permille = (unsigned int)(ratio * 1000.0f + 0.5f);
+        if (ratio_permille > 9999u) ratio_permille = 9999u;
+        g_project3_vad_band_ratio_permille[b] = ratio_permille;
+
+        if (b > 0u) {
+            float excess = ratio - 1.0f;
+            if (ratio >= PROJECT3_VAD_ACTIVE_BAND_RATIO) {
+                active_bands++;
+            }
+            if (excess > 0.0f) {
+                if (excess > 4.0f) excess = 4.0f;
+                speech_score += excess * score_weights[b];
+            }
+        }
+    }
+
+    low_fraction = (band_sum > PROJECT3_VAD_BAND_FLOOR)
+        ? (vad->band_smooth[0] / band_sum) : 0.0f;
+    vad->speech_score = speech_score;
+    vad->low_fraction = low_fraction;
+    vad->active_bands = (unsigned char)active_bands;
+    g_project3_vad_speech_score_permille =
+        (unsigned int)(speech_score * 1000.0f + 0.5f);
+    if (g_project3_vad_speech_score_permille > 9999u) {
+        g_project3_vad_speech_score_permille = 9999u;
+    }
+    g_project3_vad_low_fraction_permille =
+        (unsigned int)(low_fraction * 1000.0f + 0.5f);
+    if (g_project3_vad_low_fraction_permille > 1000u) {
+        g_project3_vad_low_fraction_permille = 1000u;
+    }
+    g_project3_vad_active_band_count = active_bands;
 
     if (vad->smooth_energy > start_threshold) {
         if (vad->speech_hold_frames < 255) vad->speech_hold_frames++;
@@ -1009,7 +1371,9 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx, float frame_energ
 
 static unsigned char Project3_ShouldEndUtterance(PROJECT3_CONTEXT *ctx)
 {
-    const unsigned short stop_frames = 10;
+    /* With four VAD updates per 1024-sample ADC block, 21 updates are about
+     * 270 ms in practice.  This protects slow commands without a long delay. */
+    const unsigned short stop_frames = 21;
     const unsigned int min_samples = PROJECT3_MIN_UTTERANCE_SAMPLES;
 
     if (ctx->vad.active && ctx->vad.silence_hold_frames >= stop_frames) {
@@ -1563,8 +1927,7 @@ static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
     ctx->pass_through_enable = PROJECT3_PASS_THROUGH_ENABLE;
     ctx->model_state = PROJECT3_MODEL_READY;
     ctx->app_state = PROJECT3_APP_BOOT;
-    ctx->vad.noise_floor = PROJECT3_VAD_MIN_FLOOR;
-    ctx->vad.smooth_energy = PROJECT3_VAD_MIN_FLOOR;
+    Project3_ResetVadAdaptiveState(&ctx->vad);
     strcpy(ctx->main_text, "Booting...");
     strcpy(ctx->line1, "Initializing system");
     strcpy(ctx->line2, "Please wait");
@@ -1599,6 +1962,7 @@ static void Project3_InitUi(PROJECT3_CONTEXT *ctx)
 
 static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
 {
+#if PROJECT3_ENABLE_KEY_CONTROLS
     if (FLAG_KEY1) {
         FLAG_KEY1 = 0;
         // KEY1: 清除当前结果，回到 listening
@@ -1612,17 +1976,25 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         Project3_ClearStableDisplay(ctx);
     }
     if (FLAG_KEY2) {
+        unsigned int b;
         FLAG_KEY2 = 0;
         // KEY2: 降低VAD灵敏度（减少误触发）
         ctx->vad.noise_floor *= 1.15f;
+        for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+            ctx->vad.band_noise[b] *= 1.15f;
+        }
         Project3_SetUiText(ctx, "VAD less sensitive", "", "");
         ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
         ctx->message_return_to_listening = 0;
     }
     if (FLAG_KEY3) {
+        unsigned int b;
         FLAG_KEY3 = 0;
         // KEY3: 提高VAD灵敏度（更容易触发）
         ctx->vad.noise_floor *= 0.85f;
+        for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+            ctx->vad.band_noise[b] *= 0.85f;
+        }
         Project3_SetUiText(ctx, "VAD more sensitive", "", "");
         ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
         ctx->message_return_to_listening = 0;
@@ -1632,12 +2004,7 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         // KEY4: 重置VAD基线
         Project3_ResetUtterance(ctx);
         Project3_ResetPreroll();
-        ctx->vad.noise_floor = PROJECT3_VAD_MIN_FLOOR;
-        ctx->vad.smooth_energy = PROJECT3_VAD_MIN_FLOOR;
-        ctx->vad.calibrate_frames = 0;
-        ctx->vad.speech_hold_frames = 0;
-        ctx->vad.silence_hold_frames = 0;
-        ctx->vad.active = 0;
+        Project3_ResetVadAdaptiveState(&ctx->vad);
         Project3_SetUiText(ctx, "Calibrating...", "", "");
         ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
         ctx->message_return_to_listening = 0;
@@ -1648,6 +2015,15 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         Project3_InitContext(ctx);
         Project3_ModelInit(ctx);
     }
+#else
+    /* Keep the hardware buttons inert in the normal demo build. */
+    (void)ctx;
+    FLAG_KEY1 = 0;
+    FLAG_KEY2 = 0;
+    FLAG_KEY3 = 0;
+    FLAG_KEY4 = 0;
+    FLAG_KEY5 = 0;
+#endif
 }
 
 static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx)
@@ -1698,10 +2074,14 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
     }
 
     for (offset = 0; offset + PROJECT3_VAD_FRAME_LEN <= block_samples; offset += PROJECT3_VAD_HOP) {
-        float frame_energy = Project3_ComputeFrameEnergy(&block[offset], PROJECT3_VAD_FRAME_LEN);
-        unsigned char started = Project3_UpdateVad(ctx, frame_energy);
+        PROJECT3_VAD_FEATURES vad_features;
+        unsigned char started;
 
-        g_project3_last_frame_energy = frame_energy;
+        Project3_ComputeVadFeatures(&block[offset], PROJECT3_VAD_FRAME_LEN,
+                                    &vad_features);
+        started = Project3_UpdateVad(ctx, &vad_features);
+
+        g_project3_last_frame_energy = vad_features.total_energy;
         g_project3_vad_noise_floor = ctx->vad.noise_floor;
         g_project3_vad_smooth_energy = ctx->vad.smooth_energy;
 
@@ -1735,8 +2115,19 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
         g_project3_vad_end_count++;
         if (ctx->utter.count >= PROJECT3_MIN_UTTERANCE_SAMPLES &&
             ctx->active_speech_samples >= PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES) {
-            Project3_HandleSpeechEnd(ctx);
+            if (Project3_IsSpeechLikeUtterance(ctx, &ctx->utter)) {
+                Project3_HandleSpeechEnd(ctx);
+            } else {
+                g_project3_nonspeech_reject_count++;
+                Project3_ResetUtterance(ctx);
+                Project3_ResetPreroll();
+                ctx->input_gate_blocks = PROJECT3_NONSPEECH_IGNORE_BLOCKS;
+                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+            }
         } else {
+            g_project3_last_voiced_frame_count = 0u;
+            g_project3_last_periodicity_permille = 0u;
             Project3_ResetUtterance(ctx);
             ctx->input_gate_blocks = 0;
         }
