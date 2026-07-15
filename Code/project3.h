@@ -77,6 +77,17 @@
  * uncached so the interrupt bridge remains coherent during inference. */
 #define PROJECT3_AUDIO_DMA_BASE             0xC7000000u
 #define PROJECT3_AUDIO_DMA_BYTES            0x00080000u
+#define PROJECT3_ENABLE_CAPTURE_QUEUE        1u
+#define PROJECT3_CAPTURE_QUEUE_SLOTS         32u
+#define PROJECT3_CAPTURE_QUEUE_MASK          (PROJECT3_CAPTURE_QUEUE_SLOTS - 1u)
+#define PROJECT3_CAPTURE_QUEUE_BASE          0xC7080000u
+#define PROJECT3_CAPTURE_QUEUE_REGION_BYTES  0x00040000u
+#define PROJECT3_AUDIO_UNCACHED_BASE         PROJECT3_AUDIO_DMA_BASE
+#define PROJECT3_AUDIO_UNCACHED_BYTES        0x000C0000u
+#if (PROJECT3_CAPTURE_QUEUE_SLOTS == 0u) || \
+    ((PROJECT3_CAPTURE_QUEUE_SLOTS & PROJECT3_CAPTURE_QUEUE_MASK) != 0u)
+#error PROJECT3_CAPTURE_QUEUE_SLOTS_must_be_a_power_of_two
+#endif
 #define PROJECT3_MUSIC_VOLUME_LEVELS        10u
 #define PROJECT3_MUSIC_DEFAULT_LEVEL        5u
 #define PROJECT3_MUSIC_Q15_FULL_SCALE       32767u
@@ -249,6 +260,7 @@ typedef struct {
     unsigned char pass_through_enable;
     unsigned char input_gate_blocks;
     unsigned char message_hold_blocks;
+    unsigned long message_hold_start_sequence;
     unsigned char message_return_to_listening;
     unsigned char error_hold_blocks;
     unsigned char redraw_needed;
@@ -307,6 +319,32 @@ static unsigned int g_project3_preroll_count = 0;
 #pragma DATA_ALIGN(g_project3_output_block, 8)
 static short g_project3_output_block[PROJECT3_BLOCK_SAMPLES];
 
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+/* The ISR and foreground share this SPSC queue.  It lives in a dedicated
+ * uncached DDR window so capture traffic cannot evict model data from cache.
+ * Each slot keeps the microphone and its synchronous electrical music
+ * reference together; delayed processing must not reread ADC ping/pong. */
+#pragma DATA_SECTION(g_project3_capture_mic, "project3_audio_queue")
+#pragma DATA_ALIGN(g_project3_capture_mic, 128)
+static volatile short g_project3_capture_mic[PROJECT3_CAPTURE_QUEUE_SLOTS]
+                                             [PROJECT3_BLOCK_SAMPLES];
+
+#pragma DATA_SECTION(g_project3_capture_ref, "project3_audio_queue")
+#pragma DATA_ALIGN(g_project3_capture_ref, 128)
+static volatile short g_project3_capture_ref[PROJECT3_CAPTURE_QUEUE_SLOTS]
+                                             [PROJECT3_BLOCK_SAMPLES];
+
+#pragma DATA_SECTION(g_project3_capture_source_sequence, "project3_audio_queue")
+#pragma DATA_ALIGN(g_project3_capture_source_sequence, 128)
+static volatile unsigned long
+    g_project3_capture_source_sequence[PROJECT3_CAPTURE_QUEUE_SLOTS];
+
+#pragma DATA_SECTION(g_project3_capture_sample_count, "project3_audio_queue")
+#pragma DATA_ALIGN(g_project3_capture_sample_count, 128)
+static volatile unsigned int
+    g_project3_capture_sample_count[PROJECT3_CAPTURE_QUEUE_SLOTS];
+#endif
+
 #pragma DATA_ALIGN(g_project3_model_wave, 8)
 static float g_project3_model_wave[PROJECT3_MODEL_SAMPLES];
 
@@ -364,6 +402,13 @@ volatile unsigned char g_project3_adc_completed_buffer = AD_BUFFER_PING;
 volatile unsigned long g_project3_adc_completed_sequence = 0u;
 volatile unsigned long g_project3_adc_consumed_sequence = 0u;
 volatile unsigned long g_project3_adc_drop_count = 0u;
+volatile unsigned long g_project3_capture_write_sequence = 0u;
+volatile unsigned long g_project3_capture_read_sequence = 0u;
+volatile unsigned int g_project3_capture_queue_depth = 0u;
+volatile unsigned int g_project3_capture_queue_high_water = 0u;
+volatile unsigned long g_project3_capture_overflow_count = 0u;
+volatile unsigned long g_project3_capture_gap_reset_count = 0u;
+volatile unsigned long g_project3_capture_last_source_sequence = 0u;
 volatile unsigned int g_project3_adc_ch1_peak = 0u;
 volatile unsigned int g_project3_adc_ch2_peak = 0u;
 volatile unsigned int g_project3_adc_ch3_peak = 0u;
@@ -460,6 +505,9 @@ static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char 
 static void Project3_RequestTextRedraw(PROJECT3_CONTEXT *ctx);
 static void Project3_LcdPauseForInference(void);
 static void Project3_LcdResumeAfterInference(void);
+static void Project3_StartMessageHold(PROJECT3_CONTEXT *ctx,
+                                      unsigned char hold_blocks,
+                                      unsigned char return_to_listening);
 static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx);
 static void Project3_ServiceErrorHold(PROJECT3_CONTEXT *ctx);
 static void Project3_ResetMemoryGuard(void);
@@ -2090,8 +2138,7 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
             /* A low-confidence command is presented as unknown instead of
              * leaving the user with an apparently frozen Listening screen. */
             Project3_CommitStableWord(ctx, "unknown");
-            ctx->message_hold_blocks = PROJECT3_RESULT_HOLD_BLOCKS;
-            ctx->message_return_to_listening = 1u;
+            Project3_StartMessageHold(ctx, PROJECT3_RESULT_HOLD_BLOCKS, 1u);
         } else {
             Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
             Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
@@ -2104,8 +2151,7 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     label = Project3_GetLabel(result.class_id);
     Project3_CommitStableWord(ctx, label);
     ctx->recognized_count++;
-    ctx->message_hold_blocks = PROJECT3_RESULT_HOLD_BLOCKS;
-    ctx->message_return_to_listening = 1u;
+    Project3_StartMessageHold(ctx, PROJECT3_RESULT_HOLD_BLOCKS, 1u);
 }
 
 #if 0
@@ -2226,6 +2272,13 @@ static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
     g_project3_adc_completed_sequence = 0u;
     g_project3_adc_consumed_sequence = 0u;
     g_project3_adc_drop_count = 0u;
+    g_project3_capture_write_sequence = 0u;
+    g_project3_capture_read_sequence = 0u;
+    g_project3_capture_queue_depth = 0u;
+    g_project3_capture_queue_high_water = 0u;
+    g_project3_capture_overflow_count = 0u;
+    g_project3_capture_gap_reset_count = 0u;
+    g_project3_capture_last_source_sequence = 0u;
     g_project3_adc_ch1_peak = 0u;
     g_project3_adc_ch2_peak = 0u;
     g_project3_adc_ch3_peak = 0u;
@@ -2278,6 +2331,7 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         ctx->last_result.valid = 0;
         ctx->input_gate_blocks = 0;
         ctx->message_hold_blocks = 0;
+        ctx->message_hold_start_sequence = 0u;
         ctx->message_return_to_listening = 0;
         ctx->error_hold_blocks = 0;
         Project3_ClearStableDisplay(ctx);
@@ -2291,8 +2345,7 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
             ctx->vad.band_noise[b] *= 1.15f;
         }
         Project3_SetUiText(ctx, "VAD less sensitive", "", "");
-        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
-        ctx->message_return_to_listening = 0;
+        Project3_StartMessageHold(ctx, PROJECT3_MESSAGE_HOLD_BLOCKS, 0u);
     }
     if (FLAG_KEY3) {
         unsigned int b;
@@ -2303,8 +2356,7 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
             ctx->vad.band_noise[b] *= 0.85f;
         }
         Project3_SetUiText(ctx, "VAD more sensitive", "", "");
-        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
-        ctx->message_return_to_listening = 0;
+        Project3_StartMessageHold(ctx, PROJECT3_MESSAGE_HOLD_BLOCKS, 0u);
     }
     if (FLAG_KEY4) {
         FLAG_KEY4 = 0;
@@ -2313,8 +2365,7 @@ static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx)
         Project3_ResetPreroll();
         Project3_ResetVadAdaptiveState(&ctx->vad);
         Project3_SetUiText(ctx, "Calibrating...", "", "");
-        ctx->message_hold_blocks = PROJECT3_MESSAGE_HOLD_BLOCKS;
-        ctx->message_return_to_listening = 0;
+        Project3_StartMessageHold(ctx, PROJECT3_MESSAGE_HOLD_BLOCKS, 0u);
     }
     if (FLAG_KEY5) {
         FLAG_KEY5 = 0;
@@ -2392,6 +2443,10 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
 
     if (ctx->input_gate_blocks > 0) {
         ctx->input_gate_blocks--;
+        /* Keep look-back audio while suppressing VAD retrigger.  A command
+         * that starts near the end of the 205 ms refractory window can then
+         * recover its first transition when VAD becomes active again. */
+        Project3_UpdatePreroll(block, block_samples);
         return;
     }
 
@@ -2507,21 +2562,41 @@ static void Project3_ResetUtterance(PROJECT3_CONTEXT *ctx)
     g_project3_current_utterance_samples = 0u;
 }
 
+static void Project3_StartMessageHold(PROJECT3_CONTEXT *ctx,
+                                      unsigned char hold_blocks,
+                                      unsigned char return_to_listening)
+{
+    ctx->message_hold_blocks = hold_blocks;
+    ctx->message_hold_start_sequence = g_project3_adc_completed_sequence;
+    ctx->message_return_to_listening = return_to_listening;
+}
+
 static void Project3_ServiceMessageHold(PROJECT3_CONTEXT *ctx)
 {
-    if (ctx->message_hold_blocks > 0) {
-        ctx->message_hold_blocks--;
-        if (ctx->message_hold_blocks == 0) {
-            if (ctx->message_return_to_listening) {
-                ctx->message_return_to_listening = 0u;
-                ctx->input_gate_blocks = 0u;
-                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
-                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
-                Project3_ResetPreroll();
-            } else {
-                Project3_RestoreStableDisplay(ctx);
-            }
-        }
+    unsigned long elapsed_blocks;
+
+    if (ctx->message_hold_blocks == 0u) {
+        return;
+    }
+
+    /* Use real ADC time, not foreground-consumed blocks.  After inference the
+     * foreground may rapidly drain a one-second backlog; decrementing once per
+     * drained block would make the result disappear almost immediately. */
+    elapsed_blocks = g_project3_adc_completed_sequence -
+                     ctx->message_hold_start_sequence;
+    if (elapsed_blocks < (unsigned long)ctx->message_hold_blocks) {
+        return;
+    }
+
+    ctx->message_hold_blocks = 0u;
+    if (ctx->message_return_to_listening) {
+        ctx->message_return_to_listening = 0u;
+        Project3_SetAppState(ctx,
+            (ctx->vad.active || ctx->utter.count > 0u) ?
+            PROJECT3_APP_SPEECH : PROJECT3_APP_LISTENING);
+        Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+    } else {
+        Project3_RestoreStableDisplay(ctx);
     }
 }
 

@@ -46,13 +46,24 @@ static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
     int target_gain;
     int gain_accumulator;
     int gain_step;
+    unsigned long adc_source_sequence;
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+    volatile short *capture_mic_dst;
+    volatile short *capture_ref_dst;
+    unsigned long capture_write_sequence;
+    unsigned long capture_read_sequence;
+    volatile unsigned long capture_readback;
+    unsigned int capture_slot;
+    unsigned int capture_depth;
+    unsigned char capture_slot_available;
+#endif
 
-    /* Publish the exact completed ADC buffer to the foreground.  Reading the
-     * global AD_Ping_Pong later is racy when another EDMA completion occurs
-     * before the foreground reaches the copy.  Sequence is written last so
-     * it acts as the publication marker. */
+    /* Keep a real ADC-time sequence even when the foreground is blocked by
+     * inference.  It also drives display hold time independently of backlog
+     * consumption. */
+    adc_source_sequence = g_project3_adc_completed_sequence + 1u;
     g_project3_adc_completed_buffer = completed_buffer;
-    g_project3_adc_completed_sequence++;
+    g_project3_adc_completed_sequence = adc_source_sequence;
 
     cycle_start = TSCL;
     count = sample_len;
@@ -75,6 +86,26 @@ static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
     mic_src = (completed_buffer == AD_BUFFER_PING) ? AD_CH1_Buf0 : AD_CH1_Buf1;
     mic2_src = (completed_buffer == AD_BUFFER_PING) ? AD_CH2_Buf0 : AD_CH2_Buf1;
     dst = Project3_GetInactiveMusicOutput(active_output, &output_buffer);
+
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+    /* SPSC reserve: the interrupt only advances write_sequence; the
+     * foreground only advances read_sequence.  When full, keep the queued
+     * chronological data and drop this newest block. */
+    capture_write_sequence = g_project3_capture_write_sequence;
+    capture_read_sequence = g_project3_capture_read_sequence;
+    capture_slot_available =
+        ((capture_write_sequence - capture_read_sequence) <
+         PROJECT3_CAPTURE_QUEUE_SLOTS) ? 1u : 0u;
+    capture_slot = (unsigned int)(capture_write_sequence &
+                                  PROJECT3_CAPTURE_QUEUE_MASK);
+    capture_mic_dst = g_project3_capture_mic[capture_slot];
+    capture_ref_dst = g_project3_capture_ref[capture_slot];
+    if (!capture_slot_available) {
+        g_project3_capture_overflow_count++;
+        g_project3_adc_drop_count++;
+        g_project3_capture_queue_depth = PROJECT3_CAPTURE_QUEUE_SLOTS;
+    }
+#endif
 
     /* C7000000-C707FFFF is configured non-cacheable in main(), so this ISR
      * sees fresh EDMA input and PRU0 sees every output write without cache
@@ -99,6 +130,13 @@ static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
         int right_magnitude = (right_sample < 0) ? -right_sample : right_sample;
         int gain = gain_accumulator / 65536;
         int output_sample = (input_sample * gain) / 32768;
+
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+        if (capture_slot_available) {
+            capture_mic_dst[i] = (short)mic_sample;
+            capture_ref_dst[i] = (short)input_sample;
+        }
+#endif
 
         if ((unsigned int)magnitude > peak) {
             peak = (unsigned int)magnitude;
@@ -125,7 +163,35 @@ static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
     }
     for (; i < PROJECT3_BLOCK_SAMPLES; i++) {
         dst[i] = 0;
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+        if (capture_slot_available) {
+            capture_mic_dst[i] = 0;
+            capture_ref_dst[i] = 0;
+        }
+#endif
     }
+
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+    if (capture_slot_available) {
+        g_project3_capture_sample_count[capture_slot] = count;
+        g_project3_capture_source_sequence[capture_slot] = adc_source_sequence;
+        /* All slot fields are volatile and uncached.  Publish write_sequence
+         * only after a same-region readback drains posted DDR writes. */
+        capture_readback =
+            g_project3_capture_source_sequence[capture_slot];
+        (void)capture_readback;
+        g_project3_capture_write_sequence = capture_write_sequence + 1u;
+        capture_depth = (unsigned int)
+            ((capture_write_sequence + 1u) - capture_read_sequence);
+        if (capture_depth > PROJECT3_CAPTURE_QUEUE_SLOTS) {
+            capture_depth = PROJECT3_CAPTURE_QUEUE_SLOTS;
+        }
+        g_project3_capture_queue_depth = capture_depth;
+        if (capture_depth > g_project3_capture_queue_high_water) {
+            g_project3_capture_queue_high_water = capture_depth;
+        }
+    }
+#endif
 
     s_project3_music_applied_gain_q15 = target_gain;
     g_project3_music_input_peak = (peak > 32767u) ? 32767u : peak;
@@ -153,6 +219,94 @@ static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
     (void)sample_len;
 #endif
 }
+
+#if PROJECT3_ENABLE_REALTIME_MUSIC && PROJECT3_ENABLE_CAPTURE_QUEUE
+static unsigned char Project3_PopCapturedBlock(short *mic,
+                                                short *music_ref,
+                                                unsigned int *sample_count,
+                                                unsigned long *source_sequence)
+{
+    unsigned long read_sequence;
+    unsigned long write_sequence;
+    unsigned long next_read_sequence;
+    unsigned int slot;
+    unsigned int count;
+    unsigned int depth;
+    unsigned int i;
+
+    read_sequence = g_project3_capture_read_sequence;
+    write_sequence = g_project3_capture_write_sequence;
+    if (read_sequence == write_sequence) {
+        g_project3_capture_queue_depth = 0u;
+        return 0u;
+    }
+
+    /* write_sequence is the producer's volatile publication marker. */
+    slot = (unsigned int)(read_sequence & PROJECT3_CAPTURE_QUEUE_MASK);
+    count = g_project3_capture_sample_count[slot];
+    if (count > PROJECT3_BLOCK_SAMPLES) {
+        count = PROJECT3_BLOCK_SAMPLES;
+    }
+    for (i = 0u; i < count; i++) {
+        mic[i] = g_project3_capture_mic[slot][i];
+        music_ref[i] = g_project3_capture_ref[slot][i];
+    }
+    *sample_count = count;
+    *source_sequence = g_project3_capture_source_sequence[slot];
+
+    /* Release this slot only after both private foreground copies finish. */
+    next_read_sequence = read_sequence + 1u;
+    g_project3_capture_read_sequence = next_read_sequence;
+    write_sequence = g_project3_capture_write_sequence;
+    depth = (unsigned int)(write_sequence - next_read_sequence);
+    if (depth > PROJECT3_CAPTURE_QUEUE_SLOTS) {
+        depth = PROJECT3_CAPTURE_QUEUE_SLOTS;
+    }
+    g_project3_capture_queue_depth = depth;
+    return 1u;
+}
+
+static void Project3_HandleCaptureSequence(PROJECT3_CONTEXT *ctx,
+                                           unsigned long source_sequence)
+{
+    unsigned long expected_sequence;
+    unsigned int b;
+
+    if (g_project3_capture_last_source_sequence != 0u) {
+        expected_sequence = g_project3_capture_last_source_sequence + 1u;
+        if (source_sequence != expected_sequence) {
+            /* Never join speech from opposite sides of a dropped interval. */
+            g_project3_capture_gap_reset_count++;
+            Project3_ResetUtterance(ctx);
+            Project3_ResetPreroll();
+            ctx->input_gate_blocks = 0u;
+            ctx->vad.smooth_energy = ctx->vad.noise_floor;
+            ctx->vad.speech_score = 0.0f;
+            ctx->vad.low_fraction = 0.0f;
+            ctx->vad.active_bands = 0u;
+            for (b = 0u; b < PROJECT3_VAD_BAND_COUNT; b++) {
+                ctx->vad.band_smooth[b] = ctx->vad.band_noise[b];
+                g_project3_vad_band_ratio_permille[b] = 0u;
+            }
+            g_project3_vad_smooth_energy = ctx->vad.noise_floor;
+            g_project3_vad_speech_score_permille = 0u;
+            g_project3_vad_low_fraction_permille = 0u;
+            g_project3_vad_active_band_count = 0u;
+            g_project3_last_voiced_frame_count = 0u;
+            g_project3_last_periodicity_permille = 0u;
+            if (ctx->app_state == PROJECT3_APP_SPEECH &&
+                ctx->message_hold_blocks == 0u &&
+                ctx->error_hold_blocks == 0u) {
+                Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+                Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+            }
+        }
+    }
+
+    g_project3_capture_last_source_sequence = source_sequence;
+    g_project3_adc_consumed_sequence = source_sequence;
+}
+#endif
 
 static void Project3_ApplyAcceptedMusicCommand(PROJECT3_CONTEXT *ctx,
                                                unsigned char class_id)
@@ -206,18 +360,32 @@ int main(void)
     static PROJECT3_CONTEXT ctx;
     unsigned int i;
 #if PROJECT3_ENABLE_REALTIME_MUSIC
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+    unsigned int captured_samples;
+    unsigned long captured_source_sequence;
+#else
     unsigned long ready_sequence;
     unsigned long confirm_sequence;
     unsigned long sequence_delta;
     unsigned char completed_buffer;
+#endif
 #endif
 
     Project3_InitContext(&ctx);
 
     Sys_Init();
 #if PROJECT3_ENABLE_REALTIME_MUSIC
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+    /* C7 is one MAR window.  Flush every startup zero-fill before disabling
+     * caching for both the DMA buffers and the adjacent capture queue. */
+    CacheWBInv(PROJECT3_AUDIO_UNCACHED_BASE,
+               PROJECT3_AUDIO_UNCACHED_BYTES);
+    CacheDisableMAR(PROJECT3_AUDIO_UNCACHED_BASE,
+                    PROJECT3_AUDIO_UNCACHED_BYTES);
+#else
     CacheWBInv(PROJECT3_AUDIO_DMA_BASE, PROJECT3_AUDIO_DMA_BYTES);
     CacheDisableMAR(PROJECT3_AUDIO_DMA_BASE, PROJECT3_AUDIO_DMA_BYTES);
+#endif
 #endif
 #if PROJECT3_ENABLE_KEY_CONTROLS
     Key_Init();
@@ -255,6 +423,21 @@ int main(void)
         Project3_HandleTouch(&ctx);
 
 #if PROJECT3_ENABLE_REALTIME_MUSIC
+#if PROJECT3_ENABLE_CAPTURE_QUEUE
+        if (Project3_PopCapturedBlock(g_project3_input_block,
+                                      g_project3_output_block,
+                                      &captured_samples,
+                                      &captured_source_sequence)) {
+            Project3_HandleCaptureSequence(&ctx, captured_source_sequence);
+            Project3_SuppressMusicReference(g_project3_input_block,
+                                            g_project3_output_block,
+                                            captured_samples);
+            FLAG_AD = 0;
+            Project3_ProcessAudioBlock(&ctx, g_project3_input_block,
+                                       captured_samples);
+            FLAG_DA = 0;
+        }
+#else
         do {
             ready_sequence = g_project3_adc_completed_sequence;
             completed_buffer = g_project3_adc_completed_buffer;
@@ -272,6 +455,7 @@ int main(void)
             Project3_ProcessAudioBlock(&ctx, g_project3_input_block, PROJECT3_BLOCK_SAMPLES);
             FLAG_DA = 0;
         }
+#endif
 #else
         if (FLAG_AD == 1) {
             unsigned char completed_buffer =
