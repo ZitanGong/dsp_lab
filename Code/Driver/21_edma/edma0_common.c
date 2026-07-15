@@ -26,7 +26,9 @@ static void Edma3CCErrHandlerIsr(void);
 /**
  * @brief EDMA 回调函数数组
  */
-void (*cb_Fxn[])(unsigned int tccNum, unsigned int status, void *appData);
+void (*cb_Fxn[EDMA3_NUM_TCC])(unsigned int tccNum,
+                              unsigned int status,
+                              void *appData) = {0};
 
 /**
  * @brief EDMA3 初始化函数
@@ -115,7 +117,10 @@ static void Edma3CCComplHandlerIsr(void)
                     EDMA3ClrIntr(SOC_EDMA30CC_0_REGS, indexl);
                     
                     // 调用回调函数
-                    (*cb_Fxn[indexl])(indexl, EDMA3_XFER_COMPLETE, NULL);
+                    if ((indexl < EDMA3_NUM_TCC) && (cb_Fxn[indexl] != 0))
+                    {
+                        (*cb_Fxn[indexl])(indexl, EDMA3_XFER_COMPLETE, NULL);
+                    }
                 }
                 ++indexl;
                 pendingIrqs >>= 1u;

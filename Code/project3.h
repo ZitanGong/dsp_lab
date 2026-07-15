@@ -57,13 +57,39 @@
 #define PROJECT3_PI                         3.14159265358979323846f
 
 /* Hardware stream: use 20 kHz ADC, then decimate 5 -> 4 to match the PC training rate of 16 kHz. */
+#define PROJECT3_ENABLE_REALTIME_MUSIC       1
 #define PROJECT3_ADC_RATE                   ADC_20KHZ
 #define PROJECT3_DAC_RATE                   DAC_20KHZ
 #define PROJECT3_BLOCK_SAMPLES              ADC_SAMPLE_1024
+#if PROJECT3_ENABLE_REALTIME_MUSIC
+#define PROJECT3_DAC_CHANNEL_MASK           DAC_CHANNEL_2
+#else
 #define PROJECT3_DAC_CHANNEL_MASK           DAC_CHANNEL_1
+#endif
 #define PROJECT3_HW_SAMPLE_RATE             20000
 #define PROJECT3_MODEL_SAMPLE_RATE          16000
 #define PROJECT3_DSP_CLOCK_HZ               456000000u
+
+/* ADC CH1 remains the microphone/KWS input.  The LINE1 stereo jack shares
+ * CH1/CH2 with MIC1/MIC2 and disconnects those microphones when inserted, so
+ * live music must use the independent LINE2 pair on ADC CH3/CH4.  Music is
+ * downmixed to mono and routed to DAC CH2.  The fixed AD/DA DMA window is
+ * uncached so the interrupt bridge remains coherent during inference. */
+#define PROJECT3_AUDIO_DMA_BASE             0xC7000000u
+#define PROJECT3_AUDIO_DMA_BYTES            0x00080000u
+#define PROJECT3_MUSIC_VOLUME_LEVELS        10u
+#define PROJECT3_MUSIC_DEFAULT_LEVEL        5u
+#define PROJECT3_MUSIC_Q15_FULL_SCALE       32767u
+
+/* The LINE2 CH3/CH4 downmix is also used as a synchronous music reference for
+ * the CH1 microphone stream.  A least-squares projection removes only the
+ * component of CH1 correlated with the electrical music input; uncorrelated
+ * speech is retained. */
+#define PROJECT3_ENABLE_MUSIC_REFERENCE      1u
+#define PROJECT3_MUSIC_REF_ON_PEAK           256u
+#define PROJECT3_MUSIC_REF_OFF_PEAK          128u
+#define PROJECT3_MUSIC_REF_MIN_CORR_SQ        0.0625f
+#define PROJECT3_MUSIC_REF_MAX_ABS_GAIN       2.0f
 
 /* One command is normalized to the same 1-second waveform used by train_bcresnet.py. */
 #define PROJECT3_RAW_MAX_SAMPLES            (PROJECT3_HW_SAMPLE_RATE * 13 / 10)
@@ -96,7 +122,7 @@
 #define PROJECT3_MIN_UTTERANCE_SAMPLES      (PROJECT3_HW_SAMPLE_RATE / 5)
 #define PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES  (PROJECT3_HW_SAMPLE_RATE * 11 / 50)
 #define PROJECT3_VAD_ABS_START_ENERGY       2.5e-6f
-#define PROJECT3_POST_INFER_IGNORE_BLOCKS   20
+#define PROJECT3_POST_INFER_IGNORE_BLOCKS   4
 #define PROJECT3_MESSAGE_HOLD_BLOCKS        20
 #define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE / PROJECT3_BLOCK_SAMPLES) + 1)
 #define PROJECT3_ERROR_HOLD_BLOCKS          50
@@ -115,6 +141,7 @@
 #define PROJECT3_SPEECH_PERIODICITY_SQ       0.0784f
 #define PROJECT3_SPEECH_REQUIRED_FRAMES      2u
 #define PROJECT3_NONSPEECH_IGNORE_BLOCKS     4u
+#define PROJECT3_ENABLE_SPEECHLIKE_VETO       1u
 
 #define PROJECT3_CENTER_X                   400
 #define PROJECT3_CENTER_Y                   215
@@ -208,6 +235,8 @@ typedef struct {
     char line1[PROJECT3_UI_TEXT_LEN];
     char line2[PROJECT3_UI_TEXT_LEN];
     char last_main_text[PROJECT3_RESULT_TEXT_LEN];
+    unsigned int last_music_volume_percent;
+    unsigned char last_music_playing;
     char last_line1[PROJECT3_UI_TEXT_LEN];
     char last_line2[PROJECT3_UI_TEXT_LEN];
     char stable_text[PROJECT3_RESULT_TEXT_LEN];
@@ -224,6 +253,7 @@ typedef struct {
     unsigned char error_hold_blocks;
     unsigned char redraw_needed;
     unsigned char stable_text_valid;
+    unsigned char music_ref_last_active;
 } PROJECT3_CONTEXT;
 
 // LCD防重入标志
@@ -233,6 +263,10 @@ static unsigned char s_lcd_layout_ready = 0u;
 
 static void Project3_InitContext(PROJECT3_CONTEXT *ctx);
 static void Project3_InitUi(PROJECT3_CONTEXT *ctx);
+static void Project3_RealtimeMusicCallback(unsigned char completed_buffer,
+                                           unsigned int sample_len);
+static void Project3_ApplyAcceptedMusicCommand(PROJECT3_CONTEXT *ctx,
+                                               unsigned char class_id);
 static void Project3_HandleKeys(PROJECT3_CONTEXT *ctx);
 static void Project3_HandleTouch(PROJECT3_CONTEXT *ctx);
 static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsigned int block_samples);
@@ -326,12 +360,22 @@ static volatile unsigned char g_project3_memory_fault = 0;
 volatile unsigned long g_project3_last_inference_ms = 0u;
 volatile unsigned long g_project3_last_utterance_samples = 0u;
 volatile unsigned long g_project3_audio_block_count = 0u;
+volatile unsigned char g_project3_adc_completed_buffer = AD_BUFFER_PING;
+volatile unsigned long g_project3_adc_completed_sequence = 0u;
+volatile unsigned long g_project3_adc_consumed_sequence = 0u;
+volatile unsigned long g_project3_adc_drop_count = 0u;
+volatile unsigned int g_project3_adc_ch1_peak = 0u;
+volatile unsigned int g_project3_adc_ch2_peak = 0u;
+volatile unsigned int g_project3_adc_ch3_peak = 0u;
+volatile unsigned int g_project3_adc_ch4_peak = 0u;
 volatile unsigned long g_project3_vad_start_count = 0u;
 volatile unsigned long g_project3_vad_end_count = 0u;
 volatile unsigned long g_project3_current_utterance_samples = 0u;
 volatile float g_project3_last_frame_energy = 0.0f;
 volatile float g_project3_vad_noise_floor = 0.0f;
 volatile float g_project3_vad_smooth_energy = 0.0f;
+volatile float g_project3_vad_start_threshold = 0.0f;
+volatile unsigned int g_project3_vad_calibrate_frames = 0u;
 volatile short g_project3_audio_peak = 0;
 volatile unsigned char g_project3_raw_top_class = PROJECT3_CLASS_SILENCE;
 volatile unsigned char g_project3_raw_second_class = PROJECT3_CLASS_SILENCE;
@@ -346,6 +390,35 @@ volatile unsigned int g_project3_vad_speech_score_permille = 0u;
 volatile unsigned int g_project3_vad_low_fraction_permille = 0u;
 volatile unsigned int g_project3_vad_active_band_count = 0u;
 volatile unsigned int g_project3_vad_band_ratio_permille[PROJECT3_VAD_BAND_COUNT] = {0u, 0u, 0u, 0u, 0u};
+
+/* Music observables are independent of PROJECT3_CONTEXT because the audio
+ * bridge runs from the ADC EDMA completion interrupt. */
+volatile unsigned char g_project3_music_playing = 1u;
+volatile unsigned char g_project3_music_volume_level = PROJECT3_MUSIC_DEFAULT_LEVEL;
+volatile unsigned int g_project3_music_volume_percent =
+    (PROJECT3_MUSIC_DEFAULT_LEVEL * 100u) / PROJECT3_MUSIC_VOLUME_LEVELS;
+volatile unsigned int g_project3_music_user_gain_q15 =
+    (PROJECT3_MUSIC_DEFAULT_LEVEL * PROJECT3_MUSIC_Q15_FULL_SCALE) /
+    PROJECT3_MUSIC_VOLUME_LEVELS;
+volatile unsigned long g_project3_music_block_count = 0u;
+volatile unsigned long g_project3_music_sync_miss_count = 0u;
+volatile unsigned long g_project3_music_command_count = 0u;
+volatile unsigned long g_project3_music_last_isr_cycles = 0u;
+volatile unsigned long g_project3_music_max_isr_cycles = 0u;
+volatile unsigned int g_project3_music_input_peak = 0u;
+volatile unsigned char g_project3_music_last_command = PROJECT3_CLASS_SILENCE;
+volatile unsigned char g_project3_music_last_output_buffer = DA_BUFFER_PING;
+volatile unsigned char g_project3_music_ref_enabled = PROJECT3_ENABLE_MUSIC_REFERENCE;
+volatile unsigned char g_project3_music_ref_active = 0u;
+volatile unsigned char g_project3_music_ref_correlated = 0u;
+volatile unsigned int g_project3_music_ref_corr_permille = 0u;
+volatile int g_project3_music_ref_gain_q15 = 0;
+volatile unsigned int g_project3_music_ref_residual_permille = 1000u;
+volatile unsigned int g_project3_music_ref_residual_peak = 0u;
+volatile unsigned long g_project3_music_ref_transition_count = 0u;
+static int s_project3_music_applied_gain_q15 =
+    (PROJECT3_MUSIC_DEFAULT_LEVEL * PROJECT3_MUSIC_Q15_FULL_SCALE) /
+    PROJECT3_MUSIC_VOLUME_LEVELS;
 
 extern unsigned char Lcd_Buffer[];
 
@@ -377,7 +450,9 @@ static unsigned char Project3_ShouldEndUtterance(PROJECT3_CONTEXT *ctx);
 static void Project3_AppendRawBlock(PROJECT3_CONTEXT *ctx, const short *block, unsigned int block_samples);
 static void Project3_UpdatePreroll(const short *block, unsigned int block_samples);
 static void Project3_AppendPreroll(PROJECT3_CONTEXT *ctx);
-static void Project3_CopyInputBlock(short *dst);
+static void Project3_CopyInputBlock(short *dst, unsigned char completed_buffer);
+static void Project3_SuppressMusicReference(short *mic, const short *music,
+                                            unsigned int sample_count);
 static void Project3_FillDacOutput(const PROJECT3_CONTEXT *ctx, const short *src);
 static void Project3_WriteOutputBlockToDac(const short *src);
 static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx);
@@ -596,6 +671,9 @@ static void Project3_DrawSafeTextToBand(const char *text, unsigned long color)
     tRectangle rect;
     const tFont *main_font;
     unsigned long main_color;
+    char music_status[32];
+    unsigned int volume_percent;
+    unsigned char music_playing;
 
     GrOffScreen16BPPInit(&display, g_project3_text_buffer,
                          P3_TEXT_BAND_W, P3_TEXT_BAND_H);
@@ -658,6 +736,23 @@ static void Project3_DrawSafeTextToBand(const char *text, unsigned long color)
     GrContextBackgroundSet(&context, 0x081A2Au);
     GrStringDrawCentered(&context, text, -1,
                          P3_TEXT_BAND_W / 2, 128, 0);
+
+    /* Snapshot the user-facing music state once per UI redraw.  The ADC ISR
+     * only consumes these values; LCD drawing remains in the foreground. */
+    music_playing = g_project3_music_playing;
+    volume_percent = g_project3_music_volume_percent;
+    if (volume_percent > 100u) {
+        volume_percent = 100u;
+    }
+    snprintf(music_status, sizeof(music_status),
+             "MUSIC %s   VOL %u%%",
+             music_playing ? "ON" : "OFF",
+             volume_percent);
+    GrContextFontSet(&context, &g_sFontCm20);
+    GrContextForegroundSet(&context, 0x86A9C0u);
+    GrContextBackgroundSet(&context, 0x081A2Au);
+    GrStringDrawCentered(&context, music_status, -1,
+                         P3_TEXT_BAND_W / 2, 170, 0);
 
     GrContextForegroundSet(&context,
                            (strcmp(text, P3_LISTENING_TEXT) == 0) ?
@@ -1089,6 +1184,8 @@ static void Project3_ResetVadAdaptiveState(PROJECT3_VAD_STATE *vad)
     g_project3_vad_speech_score_permille = 0u;
     g_project3_vad_low_fraction_permille = 0u;
     g_project3_vad_active_band_count = 0u;
+    g_project3_vad_start_threshold = PROJECT3_VAD_ABS_START_ENERGY;
+    g_project3_vad_calibrate_frames = 0u;
 }
 
 static unsigned char Project3_IsSpeechLikeUtterance(const PROJECT3_CONTEXT *ctx,
@@ -1254,6 +1351,7 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx,
             vad->band_smooth[b] = vad->band_noise[b];
         }
         vad->calibrate_frames++;
+        g_project3_vad_calibrate_frames = vad->calibrate_frames;
         vad->speech_hold_frames = 0;
         vad->silence_hold_frames = 0;
         return 0;
@@ -1296,6 +1394,8 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx,
     if (start_threshold < PROJECT3_VAD_ABS_START_ENERGY) {
         start_threshold = PROJECT3_VAD_ABS_START_ENERGY;
     }
+    g_project3_vad_start_threshold = start_threshold;
+    g_project3_vad_calibrate_frames = vad->calibrate_frames;
     stop_threshold = vad->noise_floor * stop_ratio;
     if (stop_threshold < PROJECT3_VAD_ABS_START_ENERGY * 0.45f) {
         stop_threshold = PROJECT3_VAD_ABS_START_ENERGY * 0.45f;
@@ -1371,8 +1471,8 @@ static unsigned char Project3_UpdateVad(PROJECT3_CONTEXT *ctx,
 
 static unsigned char Project3_ShouldEndUtterance(PROJECT3_CONTEXT *ctx)
 {
-    /* With four VAD updates per 1024-sample ADC block, 21 updates are about
-     * 270 ms in practice.  This protects slow commands without a long delay. */
+    /* With four VAD updates per 1024-sample ADC block, 21 quiet updates are
+     * about 270 ms in practice and protect slow command endings. */
     const unsigned short stop_frames = 21;
     const unsigned int min_samples = PROJECT3_MIN_UTTERANCE_SAMPLES;
 
@@ -1445,16 +1545,173 @@ static void Project3_AppendPreroll(PROJECT3_CONTEXT *ctx)
     }
 }
 
-static void Project3_CopyInputBlock(short *dst)
+static void Project3_SuppressMusicReference(short *mic, const short *music,
+                                            unsigned int sample_count)
 {
-    short *src = (AD_Ping_Pong == AD_BUFFER_PONG) ? AD_CH1_Buf0 : AD_CH1_Buf1;
+    static unsigned char reference_active = 0u;
+    unsigned int i;
+    unsigned int mic_peak = 0u;
+    unsigned int music_peak = 0u;
+    unsigned int residual_peak = 0u;
+    float mic_sum = 0.0f;
+    float music_sum = 0.0f;
+    float mic_mean;
+    float music_mean;
+    float mic_energy = 0.0f;
+    float music_energy = 0.0f;
+    float covariance = 0.0f;
+    float correlation_sq;
+    float cancellation_gain;
+    float residual_energy = 0.0f;
+    float residual_ratio;
+
+    if (!g_project3_music_ref_enabled || sample_count == 0u) {
+        reference_active = 0u;
+        g_project3_music_ref_active = 0u;
+        g_project3_music_ref_correlated = 0u;
+        g_project3_music_ref_corr_permille = 0u;
+        g_project3_music_ref_gain_q15 = 0;
+        g_project3_music_ref_residual_permille = 1000u;
+        g_project3_music_ref_residual_peak = 0u;
+        return;
+    }
+
+    for (i = 0u; i < sample_count; i++) {
+        int mic_sample = (int)mic[i];
+        int music_sample = (int)music[i];
+        unsigned int mic_magnitude = (unsigned int)
+            ((mic_sample < 0) ? -mic_sample : mic_sample);
+        unsigned int music_magnitude = (unsigned int)
+            ((music_sample < 0) ? -music_sample : music_sample);
+
+        if (mic_magnitude > mic_peak) mic_peak = mic_magnitude;
+        if (music_magnitude > music_peak) music_peak = music_magnitude;
+        mic_sum += (float)mic_sample;
+        music_sum += (float)music_sample;
+    }
+
+    if (reference_active) {
+        if (music_peak < PROJECT3_MUSIC_REF_OFF_PEAK) {
+            reference_active = 0u;
+        }
+    } else if (music_peak >= PROJECT3_MUSIC_REF_ON_PEAK) {
+        reference_active = 1u;
+    }
+    g_project3_music_ref_active = reference_active;
+
+    if (!reference_active) {
+        g_project3_music_ref_correlated = 0u;
+        g_project3_music_ref_corr_permille = 0u;
+        g_project3_music_ref_gain_q15 = 0;
+        g_project3_music_ref_residual_permille = 1000u;
+        g_project3_music_ref_residual_peak = mic_peak;
+        return;
+    }
+
+    mic_mean = mic_sum / (float)sample_count;
+    music_mean = music_sum / (float)sample_count;
+    for (i = 0u; i < sample_count; i++) {
+        float x = (float)mic[i] - mic_mean;
+        float r = (float)music[i] - music_mean;
+        mic_energy += x * x;
+        music_energy += r * r;
+        covariance += x * r;
+    }
+
+    if (mic_energy <= 1.0f || music_energy <= 1.0f) {
+        g_project3_music_ref_correlated = 0u;
+        g_project3_music_ref_corr_permille = 0u;
+        g_project3_music_ref_gain_q15 = 0;
+        g_project3_music_ref_residual_permille = 1000u;
+        g_project3_music_ref_residual_peak = mic_peak;
+        return;
+    }
+
+    correlation_sq = (covariance * covariance) /
+        (mic_energy * music_energy);
+    if (correlation_sq > 1.0f) correlation_sq = 1.0f;
+    g_project3_music_ref_corr_permille =
+        (unsigned int)(sqrtf(correlation_sq) * 1000.0f + 0.5f);
+
+    if (correlation_sq < PROJECT3_MUSIC_REF_MIN_CORR_SQ) {
+        g_project3_music_ref_correlated = 0u;
+        g_project3_music_ref_gain_q15 = 0;
+        g_project3_music_ref_residual_permille = 1000u;
+        g_project3_music_ref_residual_peak = mic_peak;
+        return;
+    }
+
+    cancellation_gain = covariance / music_energy;
+    if (cancellation_gain > PROJECT3_MUSIC_REF_MAX_ABS_GAIN) {
+        cancellation_gain = PROJECT3_MUSIC_REF_MAX_ABS_GAIN;
+    } else if (cancellation_gain < -PROJECT3_MUSIC_REF_MAX_ABS_GAIN) {
+        cancellation_gain = -PROJECT3_MUSIC_REF_MAX_ABS_GAIN;
+    }
+
+    g_project3_music_ref_correlated = 1u;
+    g_project3_music_ref_gain_q15 =
+        (int)(cancellation_gain * 32768.0f);
+
+    for (i = 0u; i < sample_count; i++) {
+        float reference = (float)music[i] - music_mean;
+        float residual = ((float)mic[i] - mic_mean) -
+            cancellation_gain * reference;
+        int output_sample;
+        unsigned int magnitude;
+
+        residual_energy += residual * residual;
+        output_sample = (residual >= 0.0f) ?
+            (int)(residual + 0.5f) : (int)(residual - 0.5f);
+        if (output_sample > 32767) {
+            output_sample = 32767;
+        } else if (output_sample < -32768) {
+            output_sample = -32768;
+        }
+        mic[i] = (short)output_sample;
+        magnitude = (unsigned int)
+            ((output_sample < 0) ? -output_sample : output_sample);
+        if (magnitude > residual_peak) residual_peak = magnitude;
+    }
+
+    residual_ratio = residual_energy / mic_energy;
+    if (residual_ratio > 9.999f) residual_ratio = 9.999f;
+    g_project3_music_ref_residual_permille =
+        (unsigned int)(residual_ratio * 1000.0f + 0.5f);
+    g_project3_music_ref_residual_peak = residual_peak;
+}
+
+static void Project3_CopyInputBlock(short *dst, unsigned char completed_buffer)
+{
+    short *src = (completed_buffer == AD_BUFFER_PING) ? AD_CH1_Buf0 : AD_CH1_Buf1;
+#if PROJECT3_ENABLE_REALTIME_MUSIC
+    short *music_left =
+        (completed_buffer == AD_BUFFER_PING) ? AD_CH3_Buf0 : AD_CH3_Buf1;
+    short *music_right =
+        (completed_buffer == AD_BUFFER_PING) ? AD_CH4_Buf0 : AD_CH4_Buf1;
+    unsigned int i;
+#endif
 
     /* EDMA writes the ADC ping-pong buffers without maintaining the DSP
      * cache.  Invalidate before the CPU reads them or VAD can repeatedly see
      * an old/zero cache line even though fresh audio has arrived. */
     CacheInv((unsigned int)src,
              sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+    CacheInv((unsigned int)music_left,
+             sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+    CacheInv((unsigned int)music_right,
+             sizeof(short) * PROJECT3_BLOCK_SAMPLES);
     memcpy(dst, src, sizeof(short) * PROJECT3_BLOCK_SAMPLES);
+#if PROJECT3_ENABLE_REALTIME_MUSIC
+    /* g_project3_output_block is unused by the real-time music branch, so
+     * reuse it as a temporary stereo-to-mono reference without consuming the
+     * remaining L2 memory. */
+    for (i = 0u; i < PROJECT3_BLOCK_SAMPLES; i++) {
+        g_project3_output_block[i] =
+            (short)(((int)music_left[i] + (int)music_right[i]) / 2);
+    }
+    Project3_SuppressMusicReference(dst, g_project3_output_block,
+                                    PROJECT3_BLOCK_SAMPLES);
+#endif
 }
 
 static void Project3_FillDacOutput(const PROJECT3_CONTEXT *ctx, const short *src)
@@ -1842,6 +2099,7 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
         return;
     }
 
+    Project3_ApplyAcceptedMusicCommand(ctx, result.class_id);
     ctx->last_result = result;
     label = Project3_GetLabel(result.class_id);
     Project3_CommitStableWord(ctx, label);
@@ -1892,13 +2150,23 @@ static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char 
 static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char force_redraw)
 {
     unsigned long color;
+    unsigned int volume_percent;
+    unsigned char music_playing;
 
     if (s_lcd_busy) {
         return 0;
     }
 
+    music_playing = g_project3_music_playing;
+    volume_percent = g_project3_music_volume_percent;
+    if (volume_percent > 100u) {
+        volume_percent = 100u;
+    }
+
     if (!force_redraw &&
-        strncmp(ctx->main_text, ctx->last_main_text, PROJECT3_RESULT_TEXT_LEN) == 0) {
+        strncmp(ctx->main_text, ctx->last_main_text, PROJECT3_RESULT_TEXT_LEN) == 0 &&
+        music_playing == ctx->last_music_playing &&
+        volume_percent == ctx->last_music_volume_percent) {
         return 1;
     }
 
@@ -1912,6 +2180,8 @@ static unsigned char Project3_RenderScreen(PROJECT3_CONTEXT *ctx, unsigned char 
 
     strncpy(ctx->last_main_text, ctx->main_text, PROJECT3_RESULT_TEXT_LEN);
     ctx->last_main_text[PROJECT3_RESULT_TEXT_LEN - 1] = '\0';
+    ctx->last_music_playing = music_playing;
+    ctx->last_music_volume_percent = volume_percent;
 
     s_lcd_busy = 0;
     return 1;
@@ -1928,11 +2198,48 @@ static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
     ctx->model_state = PROJECT3_MODEL_READY;
     ctx->app_state = PROJECT3_APP_BOOT;
     Project3_ResetVadAdaptiveState(&ctx->vad);
+    g_project3_music_playing = 1u;
+    g_project3_music_volume_level = PROJECT3_MUSIC_DEFAULT_LEVEL;
+    g_project3_music_volume_percent =
+        (PROJECT3_MUSIC_DEFAULT_LEVEL * 100u) /
+        PROJECT3_MUSIC_VOLUME_LEVELS;
+    g_project3_music_user_gain_q15 =
+        (PROJECT3_MUSIC_DEFAULT_LEVEL * PROJECT3_MUSIC_Q15_FULL_SCALE) /
+        PROJECT3_MUSIC_VOLUME_LEVELS;
+    g_project3_music_block_count = 0u;
+    g_project3_music_sync_miss_count = 0u;
+    g_project3_music_command_count = 0u;
+    g_project3_music_last_isr_cycles = 0u;
+    g_project3_music_max_isr_cycles = 0u;
+    g_project3_music_input_peak = 0u;
+    g_project3_music_last_command = PROJECT3_CLASS_SILENCE;
+    g_project3_music_last_output_buffer = DA_BUFFER_PING;
+    g_project3_music_ref_enabled = PROJECT3_ENABLE_MUSIC_REFERENCE;
+    g_project3_music_ref_active = 0u;
+    g_project3_music_ref_correlated = 0u;
+    g_project3_music_ref_corr_permille = 0u;
+    g_project3_music_ref_gain_q15 = 0;
+    g_project3_music_ref_residual_permille = 1000u;
+    g_project3_music_ref_residual_peak = 0u;
+    g_project3_music_ref_transition_count = 0u;
+    g_project3_adc_completed_buffer = AD_BUFFER_PING;
+    g_project3_adc_completed_sequence = 0u;
+    g_project3_adc_consumed_sequence = 0u;
+    g_project3_adc_drop_count = 0u;
+    g_project3_adc_ch1_peak = 0u;
+    g_project3_adc_ch2_peak = 0u;
+    g_project3_adc_ch3_peak = 0u;
+    g_project3_adc_ch4_peak = 0u;
+    s_project3_music_applied_gain_q15 =
+        (PROJECT3_MUSIC_DEFAULT_LEVEL * PROJECT3_MUSIC_Q15_FULL_SCALE) /
+        PROJECT3_MUSIC_VOLUME_LEVELS;
     strcpy(ctx->main_text, "Booting...");
     strcpy(ctx->line1, "Initializing system");
     strcpy(ctx->line2, "Please wait");
     strcpy(ctx->stable_text, P3_LISTENING_TEXT);
     ctx->stable_text_valid = 0u;
+    ctx->last_music_volume_percent = 101u;
+    ctx->last_music_playing = 0xFFu;
     ctx->redraw_needed = 1;
     Project3_ResetPreroll();
     Project3_ResetMemoryGuard();
@@ -2057,6 +2364,22 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
     if (peak > 32767) peak = 32767;
     g_project3_audio_peak = (short)peak;
 
+#if PROJECT3_ENABLE_REALTIME_MUSIC
+    /* A music source appearing or disappearing changes the CH1 background
+     * statistics abruptly.  Recalibrate the VAD on the already-cleaned mic
+     * stream so the transition itself cannot become a fake command. */
+    if (ctx->music_ref_last_active != g_project3_music_ref_active) {
+        ctx->music_ref_last_active = g_project3_music_ref_active;
+        g_project3_music_ref_transition_count++;
+        Project3_ResetVadAdaptiveState(&ctx->vad);
+        Project3_ResetUtterance(ctx);
+        Project3_ResetPreroll();
+        ctx->input_gate_blocks = 0u;
+        Project3_SetAppState(ctx, PROJECT3_APP_LISTENING);
+        Project3_SetUiText(ctx, P3_LISTENING_TEXT, "", "");
+    }
+#endif
+
     Project3_ServiceErrorHold(ctx);
     Project3_ServiceMessageHold(ctx);
 
@@ -2064,9 +2387,8 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
         return;
     }
 
-    if (ctx->message_hold_blocks > 0) {
-        return;
-    }
+    /* Message hold is a display policy only.  Do not stop VAD processing here,
+     * otherwise every displayed result makes the recognizer deaf for a second. */
 
     if (ctx->input_gate_blocks > 0) {
         ctx->input_gate_blocks--;
@@ -2115,7 +2437,8 @@ static void Project3_ProcessAudioBlock(PROJECT3_CONTEXT *ctx, short *block, unsi
         g_project3_vad_end_count++;
         if (ctx->utter.count >= PROJECT3_MIN_UTTERANCE_SAMPLES &&
             ctx->active_speech_samples >= PROJECT3_MIN_ACTIVE_SPEECH_SAMPLES) {
-            if (Project3_IsSpeechLikeUtterance(ctx, &ctx->utter)) {
+            if (!PROJECT3_ENABLE_SPEECHLIKE_VETO ||
+                Project3_IsSpeechLikeUtterance(ctx, &ctx->utter)) {
                 Project3_HandleSpeechEnd(ctx);
             } else {
                 g_project3_nonspeech_reject_count++;

@@ -23,6 +23,12 @@ unsigned int syncType   = EDMA3_SYNC_AB;
 unsigned int trigMode   = EDMA3_TRIG_MODE_EVENT;
 unsigned int evtQ_adc   = 0;
 
+/* Optional real-time application hook.  FLAG_AD still preserves the original
+ * foreground API, while this hook can service a short data path even when the
+ * foreground is occupied by a long-running inference. */
+static ADC_BLOCK_CALLBACK s_adcBlockCallback = (ADC_BLOCK_CALLBACK)0;
+static unsigned int s_adcBlockSampleLen = 0u;
+
 /* EDMA参数配置 */
 static struct EDMA3CCPaRAMEntry dmaPar[3] = {
     {
@@ -84,8 +90,14 @@ static void callback_adc(unsigned int tccNum, unsigned int status, void *appData
 // 初始化ADC EDMA传输
 void Adc_EDMA_Init(unsigned int sampleLen)
 {
+    s_adcBlockSampleLen = sampleLen;
     RequestEDMA3Channels();
     AD7606Edma3Init(sampleLen);
+}
+
+void Adc_RegisterBlockCallback(ADC_BLOCK_CALLBACK callback)
+{
+    s_adcBlockCallback = callback;
 }
 
 // 申请DMA通道和TCC
@@ -142,6 +154,14 @@ static void callback_adc(unsigned int tccNum, unsigned int status, void *appData
         FLAG_AD = 1;
         
         AD_Ping_Pong = !AD_Ping_Pong;
+
+        if (s_adcBlockCallback != (ADC_BLOCK_CALLBACK)0)
+        {
+            unsigned char completedBuffer =
+                (AD_Ping_Pong == AD_BUFFER_PONG) ?
+                AD_BUFFER_PING : AD_BUFFER_PONG;
+            s_adcBlockCallback(completedBuffer, s_adcBlockSampleLen);
+        }
     }
 
     else if(EDMA3_CC_DMA_EVT_MISS == status)

@@ -68,6 +68,14 @@
 #define AD_BUFFER_PONG   1     //!< Pong缓冲区
 /** @} */
 
+/**
+ * Optional application callback invoked from the ADC EDMA completion ISR.
+ * completedBuffer identifies the ping/pong buffer that has just become safe
+ * to read.  Keep callbacks short because they execute in interrupt context.
+ */
+typedef void (*ADC_BLOCK_CALLBACK)(unsigned char completedBuffer,
+                                   unsigned int sampleLen);
+
 /// @cond INTERNAL_MACROS
 /**
  * @name DAC 内部宏定义
@@ -138,6 +146,13 @@ extern short AD_CH8_Buf1[];  //!< 通道8 Pong缓冲区
  * @param sampleLen 采样长度
  */
 void Adc_Init(unsigned int clkFreq, unsigned int sampleLen);
+
+/**
+ * @brief Register an optional per-block callback.
+ * @param callback Callback to run after a complete ADC block, or zero to
+ *                 disable the callback.
+ */
+void Adc_RegisterBlockCallback(ADC_BLOCK_CALLBACK callback);
 
 /**
  * @brief ADC启动函数
