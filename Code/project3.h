@@ -8,6 +8,7 @@
 #include "soc_C6748.h"
 #include "lcd_dma.h"
 #include "lcd_grlib.h"
+#include "DSPF_sp_fftSPxSP.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -112,6 +113,8 @@
 #define PROJECT3_HOP_SIZE                   160
 #define PROJECT3_FFT_LEN                    512
 #define PROJECT3_FREQ_NUM                   (PROJECT3_FFT_LEN / 2 + 1)
+#define PROJECT3_DSPLIB_TWIDDLE_FLOATS      (2 * PROJECT3_FFT_LEN)
+#define PROJECT3_FFT_VALIDATION_MAX_PPM     5000u
 #define PROJECT3_MELS_NUM                   40
 #define PROJECT3_MODEL_FRAMES               101
 #define PROJECT3_CMD_COUNT                  12
@@ -135,7 +138,11 @@
 #define PROJECT3_VAD_ABS_START_ENERGY       2.5e-6f
 #define PROJECT3_POST_INFER_IGNORE_BLOCKS   4
 #define PROJECT3_MESSAGE_HOLD_BLOCKS        20
-#define PROJECT3_RESULT_HOLD_BLOCKS         ((PROJECT3_HW_SAMPLE_RATE / PROJECT3_BLOCK_SAMPLES) + 1)
+#define PROJECT3_RESULT_HOLD_MS             750u
+#define PROJECT3_RESULT_HOLD_BLOCKS         \
+    ((PROJECT3_HW_SAMPLE_RATE * PROJECT3_RESULT_HOLD_MS + \
+      PROJECT3_BLOCK_SAMPLES * 1000u - 1u) / \
+     (PROJECT3_BLOCK_SAMPLES * 1000u))
 #define PROJECT3_ERROR_HOLD_BLOCKS          50
 #define PROJECT3_VAD_CALIB_FRAMES           40
 #define PROJECT3_VAD_MIN_FLOOR              1.0e-8f
@@ -351,32 +358,72 @@ static float g_project3_model_wave[PROJECT3_MODEL_SAMPLES];
 #pragma DATA_ALIGN(g_project3_window, 8)
 static float g_project3_window[PROJECT3_WIN_SIZE];
 
-#pragma DATA_ALIGN(g_project3_fft_re, 8)
-static float g_project3_fft_re[PROJECT3_FFT_LEN];
-
-#pragma DATA_ALIGN(g_project3_fft_im, 8)
-static float g_project3_fft_im[PROJECT3_FFT_LEN];
-
-#pragma DATA_ALIGN(g_project3_spec, 8)
-static float g_project3_spec[PROJECT3_FREQ_NUM];
-
 #pragma DATA_ALIGN(g_project3_mel_filter, 8)
 static float g_project3_mel_filter[PROJECT3_FREQ_NUM * PROJECT3_MELS_NUM];
 
 #pragma DATA_ALIGN(g_project3_logmel, 8)
 static float g_project3_logmel[PROJECT3_MELS_NUM * PROJECT3_MODEL_FRAMES];
 
-#pragma DATA_SECTION(g_project3_act_a, "project3_l2_data")
-#pragma DATA_ALIGN(g_project3_act_a, 8)
-static float g_project3_act_a[PROJECT3_ACT_A_MAX];
+/* Feature extraction finishes before the CNN starts, so their temporary
+ * workspaces have disjoint lifetimes.  Overlaying them puts the FFT's heavily
+ * reused data in fast on-chip L2 without increasing the already tight 256 kB
+ * L2 footprint or changing any arithmetic. */
+typedef struct {
+    float act_a[PROJECT3_ACT_A_MAX];
+    float act_b[PROJECT3_ACT_B_MAX];
+    float act_c[PROJECT3_ACT_C_MAX];
+} PROJECT3_CNN_WORKSPACE;
 
-#pragma DATA_SECTION(g_project3_act_b, "project3_l2_data")
-#pragma DATA_ALIGN(g_project3_act_b, 8)
-static float g_project3_act_b[PROJECT3_ACT_B_MAX];
+typedef struct {
+    float fft_re[PROJECT3_FFT_LEN];
+    float fft_im[PROJECT3_FFT_LEN];
+    float dsplib_input[2 * PROJECT3_FFT_LEN];
+    float dsplib_output[2 * PROJECT3_FFT_LEN];
+    float dsplib_twiddle[PROJECT3_DSPLIB_TWIDDLE_FLOATS];
+    float spec[PROJECT3_FREQ_NUM];
+} PROJECT3_FEATURE_WORKSPACE;
 
-#pragma DATA_SECTION(g_project3_act_c, "project3_l2_data")
-#pragma DATA_ALIGN(g_project3_act_c, 8)
-static float g_project3_act_c[PROJECT3_ACT_C_MAX];
+typedef union {
+    PROJECT3_CNN_WORKSPACE cnn;
+    PROJECT3_FEATURE_WORKSPACE feature;
+} PROJECT3_L2_WORKSPACE;
+
+#pragma DATA_SECTION(g_project3_l2_workspace, "project3_l2_data")
+#pragma DATA_ALIGN(g_project3_l2_workspace, 8)
+static PROJECT3_L2_WORKSPACE g_project3_l2_workspace;
+
+#define g_project3_act_a  (g_project3_l2_workspace.cnn.act_a)
+#define g_project3_act_b  (g_project3_l2_workspace.cnn.act_b)
+#define g_project3_act_c  (g_project3_l2_workspace.cnn.act_c)
+#define g_project3_fft_re (g_project3_l2_workspace.feature.fft_re)
+#define g_project3_fft_im (g_project3_l2_workspace.feature.fft_im)
+#define g_project3_dsplib_input \
+    (g_project3_l2_workspace.feature.dsplib_input)
+#define g_project3_dsplib_output \
+    (g_project3_l2_workspace.feature.dsplib_output)
+#define g_project3_dsplib_twiddle \
+    (g_project3_l2_workspace.feature.dsplib_twiddle)
+#define g_project3_spec   (g_project3_l2_workspace.feature.spec)
+
+/* DSPLIB twiddles must survive the CNN overwrite of the shared L2 workspace.
+ * Keep one master copy in DDR and copy it into the L2 feature view once per
+ * utterance.  The 64-entry bit-reversal table is the layout specified by the
+ * TI C674 DSPF_sp_fftSPxSP test driver. */
+#pragma DATA_ALIGN(g_project3_dsplib_twiddle_store, 8)
+static float
+    g_project3_dsplib_twiddle_store[PROJECT3_DSPLIB_TWIDDLE_FLOATS];
+
+#pragma DATA_ALIGN(g_project3_fft_brev, 8)
+static unsigned char g_project3_fft_brev[64] = {
+    0x0, 0x20, 0x10, 0x30, 0x8, 0x28, 0x18, 0x38,
+    0x4, 0x24, 0x14, 0x34, 0xc, 0x2c, 0x1c, 0x3c,
+    0x2, 0x22, 0x12, 0x32, 0xa, 0x2a, 0x1a, 0x3a,
+    0x6, 0x26, 0x16, 0x36, 0xe, 0x2e, 0x1e, 0x3e,
+    0x1, 0x21, 0x11, 0x31, 0x9, 0x29, 0x19, 0x39,
+    0x5, 0x25, 0x15, 0x35, 0xd, 0x2d, 0x1d, 0x3d,
+    0x3, 0x23, 0x13, 0x33, 0xb, 0x2b, 0x1b, 0x3b,
+    0x7, 0x27, 0x17, 0x37, 0xf, 0x2f, 0x1f, 0x3f
+};
 
 #pragma DATA_ALIGN(g_project3_fc_in, 8)
 static float g_project3_fc_in[32];
@@ -385,9 +432,11 @@ static float g_project3_fc_in[32];
 static PROJECT3_LOGITS_STORAGE g_project3_logits_store;
 #define g_project3_logits (g_project3_logits_store.logits)
 
+#pragma DATA_SECTION(g_project3_tw_re, "project3_l2_data")
 #pragma DATA_ALIGN(g_project3_tw_re, 8)
 static float g_project3_tw_re[PROJECT3_FFT_LEN / 2];
 
+#pragma DATA_SECTION(g_project3_tw_im, "project3_l2_data")
 #pragma DATA_ALIGN(g_project3_tw_im, 8)
 static float g_project3_tw_im[PROJECT3_FFT_LEN / 2];
 
@@ -396,6 +445,63 @@ static unsigned short g_project3_mel_last_bin[PROJECT3_MELS_NUM];
 static unsigned char g_project3_tables_ready = 0;
 static volatile unsigned char g_project3_memory_fault = 0;
 volatile unsigned long g_project3_last_inference_ms = 0u;
+volatile unsigned char g_project3_fft_dsplib_active = 1u;
+volatile unsigned char g_project3_fft_validation_done = 0u;
+volatile unsigned char g_project3_fft_validation_pass = 0u;
+volatile unsigned int g_project3_fft_validation_error_ppm = 0u;
+
+/* Low-intrusion inference profiler.  Cycle counts keep sub-microsecond
+ * information; the matching microsecond values are convenient in CCS Watch.
+ * Values are overwritten after every completed utterance and no printing is
+ * performed in the real-time path. */
+volatile unsigned long long g_project3_profile_total_cycles = 0u;
+volatile unsigned long g_project3_profile_total_us = 0u;
+volatile unsigned long long g_project3_profile_overhead_cycles = 0u;
+volatile unsigned long g_project3_profile_overhead_us = 0u;
+
+volatile unsigned long long g_project3_profile_feature_cycles = 0u;
+volatile unsigned long g_project3_profile_feature_us = 0u;
+volatile unsigned long long g_project3_profile_wave_cycles = 0u;
+volatile unsigned long g_project3_profile_wave_us = 0u;
+volatile unsigned long long g_project3_profile_frame_prep_cycles = 0u;
+volatile unsigned long g_project3_profile_frame_prep_us = 0u;
+volatile unsigned long long g_project3_profile_fft_cycles = 0u;
+volatile unsigned long g_project3_profile_fft_us = 0u;
+volatile unsigned long long g_project3_profile_power_cycles = 0u;
+volatile unsigned long g_project3_profile_power_us = 0u;
+volatile unsigned long long g_project3_profile_mel_cycles = 0u;
+volatile unsigned long g_project3_profile_mel_us = 0u;
+volatile unsigned long long g_project3_profile_norm_cycles = 0u;
+volatile unsigned long g_project3_profile_norm_us = 0u;
+
+volatile unsigned long long g_project3_profile_cnn_cycles = 0u;
+volatile unsigned long g_project3_profile_cnn_us = 0u;
+volatile unsigned long long g_project3_profile_stem_cycles = 0u;
+volatile unsigned long g_project3_profile_stem_us = 0u;
+volatile unsigned long long g_project3_profile_block1_cycles = 0u;
+volatile unsigned long g_project3_profile_block1_us = 0u;
+volatile unsigned long long g_project3_profile_block2_cycles = 0u;
+volatile unsigned long g_project3_profile_block2_us = 0u;
+volatile unsigned long long g_project3_profile_block3_cycles = 0u;
+volatile unsigned long g_project3_profile_block3_us = 0u;
+volatile unsigned long long g_project3_profile_head_cycles = 0u;
+volatile unsigned long g_project3_profile_head_us = 0u;
+volatile unsigned long long g_project3_profile_pool_fc_cycles = 0u;
+volatile unsigned long g_project3_profile_pool_fc_us = 0u;
+
+volatile unsigned long long g_project3_profile_conv_cycles = 0u;
+volatile unsigned long g_project3_profile_conv_us = 0u;
+volatile unsigned long long g_project3_profile_pointwise_cycles = 0u;
+volatile unsigned long g_project3_profile_pointwise_us = 0u;
+volatile unsigned long long g_project3_profile_depthwise_cycles = 0u;
+volatile unsigned long g_project3_profile_depthwise_us = 0u;
+volatile unsigned long long g_project3_profile_bn_cycles = 0u;
+volatile unsigned long g_project3_profile_bn_us = 0u;
+volatile unsigned long long g_project3_profile_addrelu_cycles = 0u;
+volatile unsigned long g_project3_profile_addrelu_us = 0u;
+volatile unsigned long long g_project3_profile_post_cycles = 0u;
+volatile unsigned long g_project3_profile_post_us = 0u;
+
 volatile unsigned long g_project3_last_utterance_samples = 0u;
 volatile unsigned long g_project3_audio_block_count = 0u;
 volatile unsigned char g_project3_adc_completed_buffer = AD_BUFFER_PING;
@@ -477,6 +583,8 @@ static void Project3_ClearStableDisplay(PROJECT3_CONTEXT *ctx);
 static void Project3_CommitStableWord(PROJECT3_CONTEXT *ctx, const char *label);
 static void Project3_RestoreStableDisplay(PROJECT3_CONTEXT *ctx);
 static void Project3_InitTables(void);
+static void Project3_GenerateDsplibTwiddle(float *twiddle);
+static unsigned char Project3_ValidateDsplibFft(void);
 static void Project3_Fft512(float *re, float *im);
 static float Project3_PaddedModelSample(int idx);
 static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter);
@@ -513,7 +621,14 @@ static void Project3_ServiceErrorHold(PROJECT3_CONTEXT *ctx);
 static void Project3_ResetMemoryGuard(void);
 static unsigned char Project3_CheckMemoryGuard(void);
 static PROJECT3_INFER_RESULT Project3_MemoryFaultResult(void);
+static unsigned long Project3_ProfileCyclesToUs(unsigned long long cycles);
+static void Project3_ResetInferenceProfile(void);
 
+static void Project3_PointwiseConv2d(const float *in, float *out,
+                                     int in_c, int in_h, int in_w,
+                                     int out_c, int out_h, int out_w,
+                                     int s_h, int s_w,
+                                     const float *weight);
 static void Project3_Conv2d(const float *in, float *out,
                             int in_c, int in_h, int in_w,
                             int out_c, int out_h, int out_w,
@@ -546,6 +661,63 @@ static void Project3_BCResNetForward(const float *logmel, float *logits);
 static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits);
 static unsigned char Project3_AcceptResult(const PROJECT3_INFER_RESULT *result);
 static unsigned char Project3_IsCommandClass(unsigned char class_id);
+
+static unsigned long Project3_ProfileCyclesToUs(unsigned long long cycles)
+{
+    return (unsigned long)
+        (cycles / (unsigned long long)(PROJECT3_DSP_CLOCK_HZ / 1000000u));
+}
+
+static void Project3_ResetInferenceProfile(void)
+{
+    g_project3_profile_total_cycles = 0u;
+    g_project3_profile_total_us = 0u;
+    g_project3_profile_overhead_cycles = 0u;
+    g_project3_profile_overhead_us = 0u;
+
+    g_project3_profile_feature_cycles = 0u;
+    g_project3_profile_feature_us = 0u;
+    g_project3_profile_wave_cycles = 0u;
+    g_project3_profile_wave_us = 0u;
+    g_project3_profile_frame_prep_cycles = 0u;
+    g_project3_profile_frame_prep_us = 0u;
+    g_project3_profile_fft_cycles = 0u;
+    g_project3_profile_fft_us = 0u;
+    g_project3_profile_power_cycles = 0u;
+    g_project3_profile_power_us = 0u;
+    g_project3_profile_mel_cycles = 0u;
+    g_project3_profile_mel_us = 0u;
+    g_project3_profile_norm_cycles = 0u;
+    g_project3_profile_norm_us = 0u;
+
+    g_project3_profile_cnn_cycles = 0u;
+    g_project3_profile_cnn_us = 0u;
+    g_project3_profile_stem_cycles = 0u;
+    g_project3_profile_stem_us = 0u;
+    g_project3_profile_block1_cycles = 0u;
+    g_project3_profile_block1_us = 0u;
+    g_project3_profile_block2_cycles = 0u;
+    g_project3_profile_block2_us = 0u;
+    g_project3_profile_block3_cycles = 0u;
+    g_project3_profile_block3_us = 0u;
+    g_project3_profile_head_cycles = 0u;
+    g_project3_profile_head_us = 0u;
+    g_project3_profile_pool_fc_cycles = 0u;
+    g_project3_profile_pool_fc_us = 0u;
+
+    g_project3_profile_conv_cycles = 0u;
+    g_project3_profile_conv_us = 0u;
+    g_project3_profile_pointwise_cycles = 0u;
+    g_project3_profile_pointwise_us = 0u;
+    g_project3_profile_depthwise_cycles = 0u;
+    g_project3_profile_depthwise_us = 0u;
+    g_project3_profile_bn_cycles = 0u;
+    g_project3_profile_bn_us = 0u;
+    g_project3_profile_addrelu_cycles = 0u;
+    g_project3_profile_addrelu_us = 0u;
+    g_project3_profile_post_cycles = 0u;
+    g_project3_profile_post_us = 0u;
+}
 
 static void Project3_SetAppState(PROJECT3_CONTEXT *ctx, PROJECT3_APP_STATE state)
 {
@@ -843,6 +1015,38 @@ static unsigned char Project3_ClearAndDrawText(const char *text, unsigned long c
                                          row_bytes);
 }
 
+static void Project3_GenerateDsplibTwiddle(float *twiddle)
+{
+    int i;
+    int j;
+    int k;
+    double theta;
+    const double pi = 3.14159265358979323846;
+
+    for (i = 0; i < PROJECT3_DSPLIB_TWIDDLE_FLOATS; i++) {
+        twiddle[i] = 0.0f;
+    }
+
+    /* Mixed-radix layout required by TI DSPF_sp_fftSPxSP. */
+    k = 0;
+    for (j = 1; j <= (PROJECT3_FFT_LEN >> 2); j <<= 2) {
+        for (i = 0; i < (PROJECT3_FFT_LEN >> 2); i += j) {
+            theta = 2.0 * pi * (double)i / (double)PROJECT3_FFT_LEN;
+            twiddle[k] = (float)cos(theta);
+            twiddle[k + 1] = (float)sin(theta);
+
+            theta = 4.0 * pi * (double)i / (double)PROJECT3_FFT_LEN;
+            twiddle[k + 2] = (float)cos(theta);
+            twiddle[k + 3] = (float)sin(theta);
+
+            theta = 6.0 * pi * (double)i / (double)PROJECT3_FFT_LEN;
+            twiddle[k + 4] = (float)cos(theta);
+            twiddle[k + 5] = (float)sin(theta);
+            k += 6;
+        }
+    }
+}
+
 static void Project3_InitTables(void)
 {
     int i, j;
@@ -866,6 +1070,7 @@ static void Project3_InitTables(void)
         g_project3_tw_re[i] = cosf(angle);
         g_project3_tw_im[i] = -sinf(angle);
     }
+    Project3_GenerateDsplibTwiddle(g_project3_dsplib_twiddle_store);
 
     m_min = 2595.0f * log10f(1.0f);
     m_max = 2595.0f * log10f(1.0f + ((float)PROJECT3_MODEL_SAMPLE_RATE / 2.0f) / 700.0f);
@@ -957,6 +1162,58 @@ static void Project3_Fft512(float *re, float *im)
         }
     }
 
+}
+
+static unsigned char Project3_ValidateDsplibFft(void)
+{
+    int f;
+    float ref_power;
+    float opt_power;
+    float difference;
+    float max_reference = 0.0f;
+    float max_difference = 0.0f;
+    float error_ppm;
+
+    for (f = 0; f < PROJECT3_FREQ_NUM; f++) {
+        ref_power = g_project3_fft_re[f] * g_project3_fft_re[f] +
+                    g_project3_fft_im[f] * g_project3_fft_im[f];
+        opt_power = g_project3_dsplib_output[2 * f] *
+                    g_project3_dsplib_output[2 * f] +
+                    g_project3_dsplib_output[2 * f + 1] *
+                    g_project3_dsplib_output[2 * f + 1];
+        difference = fabsf(opt_power - ref_power);
+        if (ref_power > max_reference) {
+            max_reference = ref_power;
+        }
+        if (difference > max_difference) {
+            max_difference = difference;
+        }
+    }
+
+    if (max_reference > 1.0e-20f) {
+        error_ppm = (max_difference / max_reference) * 1000000.0f;
+    } else {
+        error_ppm = (max_difference <= 1.0e-20f) ? 0.0f : 1000000.0f;
+    }
+    if (error_ppm > 4294967000.0f) {
+        error_ppm = 4294967000.0f;
+    }
+
+    g_project3_fft_validation_error_ppm =
+        (unsigned int)(error_ppm + 0.5f);
+    g_project3_fft_validation_done = 1u;
+    if (g_project3_fft_validation_error_ppm <=
+        PROJECT3_FFT_VALIDATION_MAX_PPM) {
+        g_project3_fft_validation_pass = 1u;
+        g_project3_fft_dsplib_active = 1u;
+        return 1u;
+    }
+
+    /* Never trade correctness for speed: retain the verified reference path
+     * automatically if the library/table convention does not match. */
+    g_project3_fft_validation_pass = 0u;
+    g_project3_fft_dsplib_active = 0u;
+    return 0u;
 }
 
 static float Project3_PaddedModelSample(int idx)
@@ -1053,27 +1310,104 @@ static void Project3_BuildModelWave(const PROJECT3_UTTERANCE_BUFFER *utter)
 static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float *out_logmel)
 {
     int frame, i, m, f;
+    unsigned long long total_start;
+    unsigned long long total_end;
+    unsigned long long stage_start;
+    unsigned long long stage_end;
+    unsigned long long wave_cycles;
+    unsigned long long frame_prep_cycles = 0u;
+    unsigned long long fft_cycles = 0u;
+    unsigned long long power_cycles = 0u;
+    unsigned long long mel_cycles = 0u;
+    unsigned long long norm_cycles;
+    unsigned char need_reference;
+    unsigned char use_dsplib;
+    float frame_sample;
 
+    total_start = _itoll(TSCH, TSCL);
     Project3_InitTables();
+    if (!g_project3_fft_validation_done ||
+        g_project3_fft_dsplib_active) {
+        memcpy(g_project3_dsplib_twiddle,
+               g_project3_dsplib_twiddle_store,
+               sizeof(g_project3_dsplib_twiddle_store));
+    }
+
+    stage_start = _itoll(TSCH, TSCL);
     Project3_BuildModelWave(utter);
+    stage_end = _itoll(TSCH, TSCL);
+    wave_cycles = stage_end - stage_start;
 
     for (frame = 0; frame < PROJECT3_MODEL_FRAMES; frame++) {
         int start = frame * PROJECT3_HOP_SIZE;
+
+        need_reference = (!g_project3_fft_validation_done ||
+                          !g_project3_fft_dsplib_active) ? 1u : 0u;
+        use_dsplib = (!g_project3_fft_validation_done ||
+                      g_project3_fft_dsplib_active) ? 1u : 0u;
+
+        stage_start = _itoll(TSCH, TSCL);
         for (i = 0; i < PROJECT3_FFT_LEN; i++) {
-            g_project3_fft_re[i] = 0.0f;
-            g_project3_fft_im[i] = 0.0f;
+            frame_sample = 0.0f;
+            if (i < PROJECT3_WIN_SIZE) {
+                frame_sample = Project3_PaddedModelSample(start + i) *
+                               g_project3_window[i];
+            }
+            if (use_dsplib) {
+                g_project3_dsplib_input[2 * i] = frame_sample;
+                g_project3_dsplib_input[2 * i + 1] = 0.0f;
+            }
+            if (need_reference) {
+                g_project3_fft_re[i] = frame_sample;
+                g_project3_fft_im[i] = 0.0f;
+            }
         }
-        for (i = 0; i < PROJECT3_WIN_SIZE; i++) {
-            g_project3_fft_re[i] = Project3_PaddedModelSample(start + i) * g_project3_window[i];
+        stage_end = _itoll(TSCH, TSCL);
+        frame_prep_cycles += stage_end - stage_start;
+
+        stage_start = _itoll(TSCH, TSCL);
+        if (!g_project3_fft_validation_done) {
+            Project3_Fft512(g_project3_fft_re, g_project3_fft_im);
+            DSPF_sp_fftSPxSP(PROJECT3_FFT_LEN,
+                             g_project3_dsplib_input,
+                             g_project3_dsplib_twiddle,
+                             g_project3_dsplib_output,
+                             g_project3_fft_brev,
+                             2, 0, PROJECT3_FFT_LEN);
+            Project3_ValidateDsplibFft();
+        } else if (g_project3_fft_dsplib_active) {
+            DSPF_sp_fftSPxSP(PROJECT3_FFT_LEN,
+                             g_project3_dsplib_input,
+                             g_project3_dsplib_twiddle,
+                             g_project3_dsplib_output,
+                             g_project3_fft_brev,
+                             2, 0, PROJECT3_FFT_LEN);
+        } else {
+            Project3_Fft512(g_project3_fft_re, g_project3_fft_im);
         }
+        stage_end = _itoll(TSCH, TSCL);
+        fft_cycles += stage_end - stage_start;
 
-        Project3_Fft512(g_project3_fft_re, g_project3_fft_im);
-
-        for (f = 0; f < PROJECT3_FREQ_NUM; f++) {
-            g_project3_spec[f] = g_project3_fft_re[f] * g_project3_fft_re[f]
-                                + g_project3_fft_im[f] * g_project3_fft_im[f];
+        stage_start = _itoll(TSCH, TSCL);
+        if (g_project3_fft_dsplib_active) {
+            for (f = 0; f < PROJECT3_FREQ_NUM; f++) {
+                g_project3_spec[f] =
+                    g_project3_dsplib_output[2 * f] *
+                    g_project3_dsplib_output[2 * f] +
+                    g_project3_dsplib_output[2 * f + 1] *
+                    g_project3_dsplib_output[2 * f + 1];
+            }
+        } else {
+            for (f = 0; f < PROJECT3_FREQ_NUM; f++) {
+                g_project3_spec[f] =
+                    g_project3_fft_re[f] * g_project3_fft_re[f] +
+                    g_project3_fft_im[f] * g_project3_fft_im[f];
+            }
         }
+        stage_end = _itoll(TSCH, TSCL);
+        power_cycles += stage_end - stage_start;
 
+        stage_start = _itoll(TSCH, TSCL);
         for (m = 0; m < PROJECT3_MELS_NUM; m++) {
             float mel_energy = 1.0e-6f;
             int first_bin = (int)g_project3_mel_first_bin[m];
@@ -1083,9 +1417,32 @@ static void Project3_ExtractLogMel(const PROJECT3_UTTERANCE_BUFFER *utter, float
             }
             out_logmel[m * PROJECT3_MODEL_FRAMES + frame] = logf(mel_energy);
         }
+        stage_end = _itoll(TSCH, TSCL);
+        mel_cycles += stage_end - stage_start;
     }
 
+    stage_start = _itoll(TSCH, TSCL);
     Project3_NormalizeLogMel(out_logmel);
+    stage_end = _itoll(TSCH, TSCL);
+    norm_cycles = stage_end - stage_start;
+    total_end = _itoll(TSCH, TSCL);
+
+    g_project3_profile_wave_cycles = wave_cycles;
+    g_project3_profile_wave_us = Project3_ProfileCyclesToUs(wave_cycles);
+    g_project3_profile_frame_prep_cycles = frame_prep_cycles;
+    g_project3_profile_frame_prep_us =
+        Project3_ProfileCyclesToUs(frame_prep_cycles);
+    g_project3_profile_fft_cycles = fft_cycles;
+    g_project3_profile_fft_us = Project3_ProfileCyclesToUs(fft_cycles);
+    g_project3_profile_power_cycles = power_cycles;
+    g_project3_profile_power_us = Project3_ProfileCyclesToUs(power_cycles);
+    g_project3_profile_mel_cycles = mel_cycles;
+    g_project3_profile_mel_us = Project3_ProfileCyclesToUs(mel_cycles);
+    g_project3_profile_norm_cycles = norm_cycles;
+    g_project3_profile_norm_us = Project3_ProfileCyclesToUs(norm_cycles);
+    g_project3_profile_feature_cycles = total_end - total_start;
+    g_project3_profile_feature_us =
+        Project3_ProfileCyclesToUs(total_end - total_start);
 }
 
 static void Project3_NormalizeLogMel(float *logmel)
@@ -1788,6 +2145,84 @@ static void Project3_WriteOutputBlockToDac(const short *src)
             sizeof(short) * PROJECT3_BLOCK_SAMPLES);
 }
 
+/* The BC-ResNet pointwise layers are dense matrix products with no spatial
+ * padding.  Keeping them in the six-loop generic convolution pays kernel-loop,
+ * boundary-check and index-multiply overhead for every MAC.  This path keeps
+ * the original input-channel accumulation order while walking channel planes
+ * with pointers, so it is numerically equivalent but easier for the C674x
+ * compiler to software-pipeline. */
+static void Project3_PointwiseConv2d(const float *in, float *out,
+                                     int in_c, int in_h, int in_w,
+                                     int out_c, int out_h, int out_w,
+                                     int s_h, int s_w,
+                                     const float *weight)
+{
+    int oc;
+    int oh;
+    int ow;
+    int ic;
+    int pos;
+    int in_index;
+    int in_plane = in_h * in_w;
+    int out_plane = out_h * out_w;
+    int in_stride2 = in_plane * 2;
+    int in_stride3 = in_plane * 3;
+    int in_stride4 = in_plane * 4;
+    float sum;
+    const float *weight_ptr;
+    const float *in_ptr;
+    float *out_ptr;
+
+    if (s_h == 1 && s_w == 1 &&
+        in_h == out_h && in_w == out_w) {
+        for (oc = 0; oc < out_c; oc++) {
+            weight_ptr = &weight[oc * in_c];
+            out_ptr = &out[oc * out_plane];
+            for (pos = 0; pos < out_plane; pos++) {
+                sum = 0.0f;
+                in_ptr = &in[pos];
+                for (ic = 0; ic + 3 < in_c; ic += 4) {
+                    sum += in_ptr[0] * weight_ptr[ic];
+                    sum += in_ptr[in_plane] * weight_ptr[ic + 1];
+                    sum += in_ptr[in_stride2] * weight_ptr[ic + 2];
+                    sum += in_ptr[in_stride3] * weight_ptr[ic + 3];
+                    in_ptr += in_stride4;
+                }
+                for (; ic < in_c; ic++) {
+                    sum += in_ptr[0] * weight_ptr[ic];
+                    in_ptr += in_plane;
+                }
+                out_ptr[pos] = sum;
+            }
+        }
+        return;
+    }
+
+    for (oc = 0; oc < out_c; oc++) {
+        weight_ptr = &weight[oc * in_c];
+        out_ptr = &out[oc * out_plane];
+        for (oh = 0; oh < out_h; oh++) {
+            for (ow = 0; ow < out_w; ow++) {
+                in_index = oh * s_h * in_w + ow * s_w;
+                sum = 0.0f;
+                in_ptr = &in[in_index];
+                for (ic = 0; ic + 3 < in_c; ic += 4) {
+                    sum += in_ptr[0] * weight_ptr[ic];
+                    sum += in_ptr[in_plane] * weight_ptr[ic + 1];
+                    sum += in_ptr[in_stride2] * weight_ptr[ic + 2];
+                    sum += in_ptr[in_stride3] * weight_ptr[ic + 3];
+                    in_ptr += in_stride4;
+                }
+                for (; ic < in_c; ic++) {
+                    sum += in_ptr[0] * weight_ptr[ic];
+                    in_ptr += in_plane;
+                }
+                *out_ptr++ = sum;
+            }
+        }
+    }
+}
+
 static void Project3_Conv2d(const float *in, float *out,
                             int in_c, int in_h, int in_w,
                             int out_c, int out_h, int out_w,
@@ -1795,6 +2230,21 @@ static void Project3_Conv2d(const float *in, float *out,
                             int p_h, int p_w, const float *weight)
 {
     int oc, oh, ow, ic, kh, kw;
+    unsigned long long profile_start;
+    unsigned long long profile_end;
+
+    profile_start = _itoll(TSCH, TSCL);
+    if (k_h == 1 && k_w == 1 && p_h == 0 && p_w == 0) {
+        Project3_PointwiseConv2d(in, out,
+                                in_c, in_h, in_w,
+                                out_c, out_h, out_w,
+                                s_h, s_w, weight);
+        profile_end = _itoll(TSCH, TSCL);
+        g_project3_profile_conv_cycles += profile_end - profile_start;
+        g_project3_profile_pointwise_cycles += profile_end - profile_start;
+        return;
+    }
+
     for (oc = 0; oc < out_c; oc++) {
         for (oh = 0; oh < out_h; oh++) {
             for (ow = 0; ow < out_w; ow++) {
@@ -1814,6 +2264,8 @@ static void Project3_Conv2d(const float *in, float *out,
             }
         }
     }
+    profile_end = _itoll(TSCH, TSCL);
+    g_project3_profile_conv_cycles += profile_end - profile_start;
 }
 
 static void Project3_DepthwiseConv2d(const float *in, float *out,
@@ -1823,6 +2275,10 @@ static void Project3_DepthwiseConv2d(const float *in, float *out,
                                      int p_h, int p_w, const float *weight)
 {
     int c, oh, ow, kh, kw;
+    unsigned long long profile_start;
+    unsigned long long profile_end;
+
+    profile_start = _itoll(TSCH, TSCL);
     for (c = 0; c < channels; c++) {
         for (oh = 0; oh < out_h; oh++) {
             for (ow = 0; ow < out_w; ow++) {
@@ -1840,6 +2296,8 @@ static void Project3_DepthwiseConv2d(const float *in, float *out,
             }
         }
     }
+    profile_end = _itoll(TSCH, TSCL);
+    g_project3_profile_depthwise_cycles += profile_end - profile_start;
 }
 
 static void Project3_BatchNorm(float *x, int channels, int h, int w,
@@ -1849,6 +2307,10 @@ static void Project3_BatchNorm(float *x, int channels, int h, int w,
 {
     int c, i;
     int hw = h * w;
+    unsigned long long profile_start;
+    unsigned long long profile_end;
+
+    profile_start = _itoll(TSCH, TSCL);
     for (c = 0; c < channels; c++) {
         float scale = gamma[c] / sqrtf(var[c] + PROJECT3_BN_EPS);
         float bias = beta[c] - mean[c] * scale;
@@ -1859,15 +2321,23 @@ static void Project3_BatchNorm(float *x, int channels, int h, int w,
             ptr[i] = v;
         }
     }
+    profile_end = _itoll(TSCH, TSCL);
+    g_project3_profile_bn_cycles += profile_end - profile_start;
 }
 
 static void Project3_AddRelu(float *x, const float *identity, int count)
 {
     int i;
+    unsigned long long profile_start;
+    unsigned long long profile_end;
+
+    profile_start = _itoll(TSCH, TSCL);
     for (i = 0; i < count; i++) {
         float v = x[i] + identity[i];
         x[i] = (v < 0.0f) ? 0.0f : v;
     }
+    profile_end = _itoll(TSCH, TSCL);
+    g_project3_profile_addrelu_cycles += profile_end - profile_start;
 }
 
 static void Project3_BCResBlock(const float *in, float *out,
@@ -1902,12 +2372,27 @@ static void Project3_BCResBlock(const float *in, float *out,
 static void Project3_BCResNetForward(const float *logmel, float *logits)
 {
     int c, w, cls, i;
+    unsigned long long total_start;
+    unsigned long long total_end;
+    unsigned long long stage_start;
+    unsigned long long stage_end;
+    unsigned long long stem_cycles;
+    unsigned long long block1_cycles;
+    unsigned long long block2_cycles;
+    unsigned long long block3_cycles;
+    unsigned long long head_cycles;
+    unsigned long long pool_fc_cycles;
 
+    total_start = _itoll(TSCH, TSCL);
+    stage_start = _itoll(TSCH, TSCL);
     Project3_Conv2d(logmel, g_project3_act_a, 1, 40, PROJECT3_MODEL_FRAMES,
                     16, 20, PROJECT3_MODEL_FRAMES, 3, 3, 2, 1, 1, 1, conv1_weight);
     Project3_BatchNorm(g_project3_act_a, 16, 20, PROJECT3_MODEL_FRAMES,
                        bn1_weight, bn1_bias, bn1_running_mean, bn1_running_var, 1);
+    stage_end = _itoll(TSCH, TSCL);
+    stem_cycles = stage_end - stage_start;
 
+    stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_a, g_project3_act_b,
                         16, 20, PROJECT3_MODEL_FRAMES, 8, 20, PROJECT3_MODEL_FRAMES, 1, 1,
                         layer1_conv1_weight, layer1_bn1_weight, layer1_bn1_bias, layer1_bn1_running_mean, layer1_bn1_running_var,
@@ -1915,7 +2400,10 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
                         layer1_conv2_weight, layer1_bn3_weight, layer1_bn3_bias, layer1_bn3_running_mean, layer1_bn3_running_var,
                         layer1_shortcut_0_weight, layer1_shortcut_1_weight, layer1_shortcut_1_bias,
                         layer1_shortcut_1_running_mean, layer1_shortcut_1_running_var);
+    stage_end = _itoll(TSCH, TSCL);
+    block1_cycles = stage_end - stage_start;
 
+    stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_b, g_project3_act_a,
                         8, 20, PROJECT3_MODEL_FRAMES, 12, 10, PROJECT3_MODEL_FRAMES, 2, 1,
                         layer2_conv1_weight, layer2_bn1_weight, layer2_bn1_bias, layer2_bn1_running_mean, layer2_bn1_running_var,
@@ -1923,7 +2411,10 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
                         layer2_conv2_weight, layer2_bn3_weight, layer2_bn3_bias, layer2_bn3_running_mean, layer2_bn3_running_var,
                         layer2_shortcut_0_weight, layer2_shortcut_1_weight, layer2_shortcut_1_bias,
                         layer2_shortcut_1_running_mean, layer2_shortcut_1_running_var);
+    stage_end = _itoll(TSCH, TSCL);
+    block2_cycles = stage_end - stage_start;
 
+    stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_a, g_project3_act_b,
                         12, 10, PROJECT3_MODEL_FRAMES, 16, 5, PROJECT3_MODEL_FRAMES, 2, 1,
                         layer3_conv1_weight, layer3_bn1_weight, layer3_bn1_bias, layer3_bn1_running_mean, layer3_bn1_running_var,
@@ -1931,7 +2422,10 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
                         layer3_conv2_weight, layer3_bn3_weight, layer3_bn3_bias, layer3_bn3_running_mean, layer3_bn3_running_var,
                         layer3_shortcut_0_weight, layer3_shortcut_1_weight, layer3_shortcut_1_bias,
                         layer3_shortcut_1_running_mean, layer3_shortcut_1_running_var);
+    stage_end = _itoll(TSCH, TSCL);
+    block3_cycles = stage_end - stage_start;
 
+    stage_start = _itoll(TSCH, TSCL);
     Project3_DepthwiseConv2d(g_project3_act_b, g_project3_act_a,
                              16, 5, PROJECT3_MODEL_FRAMES, 5, PROJECT3_MODEL_FRAMES,
                              3, 3, 1, 1, 1, 1, dwconv_weight);
@@ -1955,7 +2449,10 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
                     1, 1, 1, 1, 0, 0, conv_expand_weight);
     Project3_BatchNorm(g_project3_act_b, 32, 1, PROJECT3_MODEL_FRAMES,
                        bn_expand_weight, bn_expand_bias, bn_expand_running_mean, bn_expand_running_var, 1);
+    stage_end = _itoll(TSCH, TSCL);
+    head_cycles = stage_end - stage_start;
 
+    stage_start = _itoll(TSCH, TSCL);
     for (c = 0; c < 32; c++) {
         float sum = 0.0f;
         for (w = 0; w < PROJECT3_MODEL_FRAMES; w++) {
@@ -1971,6 +2468,36 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
         }
         logits[cls] = sum;
     }
+    stage_end = _itoll(TSCH, TSCL);
+    pool_fc_cycles = stage_end - stage_start;
+    total_end = _itoll(TSCH, TSCL);
+
+    g_project3_profile_stem_cycles = stem_cycles;
+    g_project3_profile_stem_us = Project3_ProfileCyclesToUs(stem_cycles);
+    g_project3_profile_block1_cycles = block1_cycles;
+    g_project3_profile_block1_us = Project3_ProfileCyclesToUs(block1_cycles);
+    g_project3_profile_block2_cycles = block2_cycles;
+    g_project3_profile_block2_us = Project3_ProfileCyclesToUs(block2_cycles);
+    g_project3_profile_block3_cycles = block3_cycles;
+    g_project3_profile_block3_us = Project3_ProfileCyclesToUs(block3_cycles);
+    g_project3_profile_head_cycles = head_cycles;
+    g_project3_profile_head_us = Project3_ProfileCyclesToUs(head_cycles);
+    g_project3_profile_pool_fc_cycles = pool_fc_cycles;
+    g_project3_profile_pool_fc_us = Project3_ProfileCyclesToUs(pool_fc_cycles);
+    g_project3_profile_cnn_cycles = total_end - total_start;
+    g_project3_profile_cnn_us =
+        Project3_ProfileCyclesToUs(total_end - total_start);
+
+    g_project3_profile_conv_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_conv_cycles);
+    g_project3_profile_pointwise_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_pointwise_cycles);
+    g_project3_profile_depthwise_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_depthwise_cycles);
+    g_project3_profile_bn_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_bn_cycles);
+    g_project3_profile_addrelu_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_addrelu_cycles);
 }
 
 static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits)
@@ -2095,6 +2622,7 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
     unsigned long long infer_start;
     unsigned long long infer_end;
     unsigned long long infer_cycles;
+    unsigned long long accounted_cycles;
 
     Project3_SetAppState(ctx, PROJECT3_APP_INFERENCING);
     Project3_SetUiText(ctx, "Processing...", "", "");
@@ -2102,10 +2630,23 @@ static void Project3_HandleSpeechEnd(PROJECT3_CONTEXT *ctx)
 
     g_project3_last_utterance_samples = ctx->utter.count;
     g_project3_result_accepted = 0u;
+    Project3_ResetInferenceProfile();
     infer_start = _itoll(TSCH, TSCL);
     result = Project3_RunInference(ctx, &ctx->utter);
     infer_end = _itoll(TSCH, TSCL);
     infer_cycles = infer_end - infer_start;
+    g_project3_profile_total_cycles = infer_cycles;
+    g_project3_profile_total_us = Project3_ProfileCyclesToUs(infer_cycles);
+    accounted_cycles = g_project3_profile_feature_cycles +
+                       g_project3_profile_cnn_cycles +
+                       g_project3_profile_post_cycles;
+    if (infer_cycles > accounted_cycles) {
+        g_project3_profile_overhead_cycles = infer_cycles - accounted_cycles;
+    } else {
+        g_project3_profile_overhead_cycles = 0u;
+    }
+    g_project3_profile_overhead_us =
+        Project3_ProfileCyclesToUs(g_project3_profile_overhead_cycles);
     g_project3_last_inference_ms =
         (unsigned long)(infer_cycles / (PROJECT3_DSP_CLOCK_HZ / 1000u));
     g_project3_raw_top_class = result.class_id;
@@ -2294,6 +2835,10 @@ static void Project3_InitContext(PROJECT3_CONTEXT *ctx)
     ctx->last_music_volume_percent = 101u;
     ctx->last_music_playing = 0xFFu;
     ctx->redraw_needed = 1;
+    g_project3_fft_dsplib_active = 1u;
+    g_project3_fft_validation_done = 0u;
+    g_project3_fft_validation_pass = 0u;
+    g_project3_fft_validation_error_ppm = 0u;
     Project3_ResetPreroll();
     Project3_ResetMemoryGuard();
     Project3_InitTables();
@@ -2521,6 +3066,8 @@ static void Project3_ModelInit(PROJECT3_CONTEXT *ctx)
 static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const PROJECT3_UTTERANCE_BUFFER *utter)
 {
     PROJECT3_INFER_RESULT result;
+    unsigned long long stage_start;
+    unsigned long long stage_end;
 
     ctx->model_state = PROJECT3_MODEL_READY;
     Project3_ResetMemoryGuard();
@@ -2538,7 +3085,12 @@ static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const 
         Project3_LcdResumeAfterInference();
         return result;
     }
+    stage_start = _itoll(TSCH, TSCL);
     result = Project3_LogitsToResult(g_project3_logits);
+    stage_end = _itoll(TSCH, TSCL);
+    g_project3_profile_post_cycles = stage_end - stage_start;
+    g_project3_profile_post_us =
+        Project3_ProfileCyclesToUs(stage_end - stage_start);
     Project3_LcdResumeAfterInference();
     return result;
 }
