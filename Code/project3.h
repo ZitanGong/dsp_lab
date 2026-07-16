@@ -118,6 +118,13 @@
 #define PROJECT3_MELS_NUM                   40
 #define PROJECT3_MODEL_FRAMES               101
 #define PROJECT3_CMD_COUNT                  12
+#define PROJECT3_EMBEDDING_SIZE             64
+#define PROJECT3_ENABLE_MODEL_SPEECH_GATE    1u
+/* Validation-calibrated two-zone gate: very speech-like events pass directly;
+ * borderline events must also have a confident command prediction. */
+#define PROJECT3_MODEL_SPEECH_LOW_THRESHOLD  0.95f
+#define PROJECT3_MODEL_SPEECH_HIGH_THRESHOLD 0.99f
+#define PROJECT3_MODEL_SPEECH_MIN_CONFIDENCE 0.60f
 #define PROJECT3_FEATURE_COUNT              (PROJECT3_MELS_NUM * PROJECT3_MODEL_FRAMES)
 
 #define PROJECT3_UI_TEXT_LEN                64
@@ -426,7 +433,7 @@ static unsigned char g_project3_fft_brev[64] = {
 };
 
 #pragma DATA_ALIGN(g_project3_fc_in, 8)
-static float g_project3_fc_in[32];
+static float g_project3_fc_in[PROJECT3_EMBEDDING_SIZE];
 
 #pragma DATA_ALIGN(g_project3_logits_store, 8)
 static PROJECT3_LOGITS_STORAGE g_project3_logits_store;
@@ -449,6 +456,10 @@ volatile unsigned char g_project3_fft_dsplib_active = 1u;
 volatile unsigned char g_project3_fft_validation_done = 0u;
 volatile unsigned char g_project3_fft_validation_pass = 0u;
 volatile unsigned int g_project3_fft_validation_error_ppm = 0u;
+volatile float g_project3_last_speech_logit = 0.0f;
+volatile float g_project3_last_speech_probability = 0.0f;
+volatile unsigned char g_project3_last_speech_gate_pass = 0u;
+volatile unsigned char g_project3_last_raw_class_id = PROJECT3_CLASS_SILENCE;
 
 /* Low-intrusion inference profiler.  Cycle counts keep sub-microsecond
  * information; the matching microsecond values are convenient in CCS Watch.
@@ -638,7 +649,8 @@ static void Project3_DepthwiseConv2d(const float *in, float *out,
                                      int channels, int in_h, int in_w,
                                      int out_h, int out_w,
                                      int k_h, int k_w, int s_h, int s_w,
-                                     int p_h, int p_w, const float *weight);
+                                     int p_h, int p_w, int d_h, int d_w,
+                                     const float *weight);
 static void Project3_BatchNorm(float *x, int channels, int h, int w,
                                const float *gamma, const float *beta,
                                const float *mean, const float *var,
@@ -648,6 +660,7 @@ static void Project3_BCResBlock(const float *in, float *out,
                                 int in_c, int in_h, int in_w,
                                 int out_c, int out_h, int out_w,
                                 int stride_h, int stride_w,
+                                int temporal_dilation,
                                 const float *conv1_w,
                                 const float *bn1_w, const float *bn1_b, const float *bn1_m, const float *bn1_v,
                                 const float *dw_w,
@@ -657,7 +670,8 @@ static void Project3_BCResBlock(const float *in, float *out,
                                 const float *shortcut_w,
                                 const float *shortcut_bn_w, const float *shortcut_bn_b,
                                 const float *shortcut_bn_m, const float *shortcut_bn_v);
-static void Project3_BCResNetForward(const float *logmel, float *logits);
+static void Project3_BCResNetForward(const float *logmel, float *logits,
+                                     float *speech_logit);
 static PROJECT3_INFER_RESULT Project3_LogitsToResult(const float *logits);
 static unsigned char Project3_AcceptResult(const PROJECT3_INFER_RESULT *result);
 static unsigned char Project3_IsCommandClass(unsigned char class_id);
@@ -2272,7 +2286,8 @@ static void Project3_DepthwiseConv2d(const float *in, float *out,
                                      int channels, int in_h, int in_w,
                                      int out_h, int out_w,
                                      int k_h, int k_w, int s_h, int s_w,
-                                     int p_h, int p_w, const float *weight)
+                                     int p_h, int p_w, int d_h, int d_w,
+                                     const float *weight)
 {
     int c, oh, ow, kh, kw;
     unsigned long long profile_start;
@@ -2284,10 +2299,10 @@ static void Project3_DepthwiseConv2d(const float *in, float *out,
             for (ow = 0; ow < out_w; ow++) {
                 float sum = 0.0f;
                 for (kh = 0; kh < k_h; kh++) {
-                    int ih = oh * s_h + kh - p_h;
+                    int ih = oh * s_h + kh * d_h - p_h;
                     if (ih < 0 || ih >= in_h) continue;
                     for (kw = 0; kw < k_w; kw++) {
-                        int iw = ow * s_w + kw - p_w;
+                        int iw = ow * s_w + kw * d_w - p_w;
                         if (iw < 0 || iw >= in_w) continue;
                         sum += in[P3_IDX3(c, ih, iw, in_h, in_w)] * weight[P3_DW(c, kh, kw, k_h, k_w)];
                     }
@@ -2344,6 +2359,7 @@ static void Project3_BCResBlock(const float *in, float *out,
                                 int in_c, int in_h, int in_w,
                                 int out_c, int out_h, int out_w,
                                 int stride_h, int stride_w,
+                                int temporal_dilation,
                                 const float *conv1_w,
                                 const float *bn1_w, const float *bn1_b, const float *bn1_m, const float *bn1_v,
                                 const float *dw_w,
@@ -2357,7 +2373,11 @@ static void Project3_BCResBlock(const float *in, float *out,
     Project3_Conv2d(in, out, in_c, in_h, in_w, out_c, in_h, in_w, 1, 1, 1, 1, 0, 0, conv1_w);
     Project3_BatchNorm(out, out_c, in_h, in_w, bn1_w, bn1_b, bn1_m, bn1_v, 1);
 
-    Project3_DepthwiseConv2d(out, g_project3_act_c, out_c, in_h, in_w, out_h, out_w, 3, 3, stride_h, stride_w, 1, 1, dw_w);
+    Project3_DepthwiseConv2d(out, g_project3_act_c,
+                             out_c, in_h, in_w, out_h, out_w,
+                             3, 3, stride_h, stride_w,
+                             1, temporal_dilation,
+                             1, temporal_dilation, dw_w);
     Project3_BatchNorm(g_project3_act_c, out_c, out_h, out_w, bn2_w, bn2_b, bn2_m, bn2_v, 1);
 
     Project3_Conv2d(g_project3_act_c, out, out_c, out_h, out_w, out_c, out_h, out_w, 1, 1, 1, 1, 0, 0, conv2_w);
@@ -2369,7 +2389,8 @@ static void Project3_BCResBlock(const float *in, float *out,
     Project3_AddRelu(out, g_project3_act_c, out_c * out_h * out_w);
 }
 
-static void Project3_BCResNetForward(const float *logmel, float *logits)
+static void Project3_BCResNetForward(const float *logmel, float *logits,
+                                     float *speech_logit)
 {
     int c, w, cls, i;
     unsigned long long total_start;
@@ -2394,7 +2415,8 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
 
     stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_a, g_project3_act_b,
-                        16, 20, PROJECT3_MODEL_FRAMES, 8, 20, PROJECT3_MODEL_FRAMES, 1, 1,
+                        16, 20, PROJECT3_MODEL_FRAMES,
+                        8, 20, PROJECT3_MODEL_FRAMES, 1, 1, 1,
                         layer1_conv1_weight, layer1_bn1_weight, layer1_bn1_bias, layer1_bn1_running_mean, layer1_bn1_running_var,
                         layer1_dwconv_weight, layer1_bn2_weight, layer1_bn2_bias, layer1_bn2_running_mean, layer1_bn2_running_var,
                         layer1_conv2_weight, layer1_bn3_weight, layer1_bn3_bias, layer1_bn3_running_mean, layer1_bn3_running_var,
@@ -2405,7 +2427,8 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
 
     stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_b, g_project3_act_a,
-                        8, 20, PROJECT3_MODEL_FRAMES, 12, 10, PROJECT3_MODEL_FRAMES, 2, 1,
+                        8, 20, PROJECT3_MODEL_FRAMES,
+                        12, 10, PROJECT3_MODEL_FRAMES, 2, 1, 2,
                         layer2_conv1_weight, layer2_bn1_weight, layer2_bn1_bias, layer2_bn1_running_mean, layer2_bn1_running_var,
                         layer2_dwconv_weight, layer2_bn2_weight, layer2_bn2_bias, layer2_bn2_running_mean, layer2_bn2_running_var,
                         layer2_conv2_weight, layer2_bn3_weight, layer2_bn3_bias, layer2_bn3_running_mean, layer2_bn3_running_var,
@@ -2416,7 +2439,8 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
 
     stage_start = _itoll(TSCH, TSCL);
     Project3_BCResBlock(g_project3_act_a, g_project3_act_b,
-                        12, 10, PROJECT3_MODEL_FRAMES, 16, 5, PROJECT3_MODEL_FRAMES, 2, 1,
+                        12, 10, PROJECT3_MODEL_FRAMES,
+                        16, 5, PROJECT3_MODEL_FRAMES, 2, 1, 4,
                         layer3_conv1_weight, layer3_bn1_weight, layer3_bn1_bias, layer3_bn1_running_mean, layer3_bn1_running_var,
                         layer3_dwconv_weight, layer3_bn2_weight, layer3_bn2_bias, layer3_bn2_running_mean, layer3_bn2_running_var,
                         layer3_conv2_weight, layer3_bn3_weight, layer3_bn3_bias, layer3_bn3_running_mean, layer3_bn3_running_var,
@@ -2428,7 +2452,7 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
     stage_start = _itoll(TSCH, TSCL);
     Project3_DepthwiseConv2d(g_project3_act_b, g_project3_act_a,
                              16, 5, PROJECT3_MODEL_FRAMES, 5, PROJECT3_MODEL_FRAMES,
-                             3, 3, 1, 1, 1, 1, dwconv_weight);
+                             3, 3, 1, 1, 1, 8, 1, 8, dwconv_weight);
     Project3_BatchNorm(g_project3_act_a, 16, 5, PROJECT3_MODEL_FRAMES,
                        bn_dw_weight, bn_dw_bias, bn_dw_running_mean, bn_dw_running_var, 1);
 
@@ -2455,18 +2479,35 @@ static void Project3_BCResNetForward(const float *logmel, float *logits)
     stage_start = _itoll(TSCH, TSCL);
     for (c = 0; c < 32; c++) {
         float sum = 0.0f;
+        float maximum =
+            g_project3_act_b[P3_IDX3(c, 0, 0, 1, PROJECT3_MODEL_FRAMES)];
         for (w = 0; w < PROJECT3_MODEL_FRAMES; w++) {
-            sum += g_project3_act_b[P3_IDX3(c, 0, w, 1, PROJECT3_MODEL_FRAMES)];
+            float value =
+                g_project3_act_b[P3_IDX3(c, 0, w,
+                                         1, PROJECT3_MODEL_FRAMES)];
+            sum += value;
+            if (value > maximum) {
+                maximum = value;
+            }
         }
         g_project3_fc_in[c] = sum / (float)PROJECT3_MODEL_FRAMES;
+        g_project3_fc_in[32 + c] = maximum;
     }
 
     for (cls = 0; cls < PROJECT3_CMD_COUNT; cls++) {
         float sum = fc_bias[cls];
-        for (i = 0; i < 32; i++) {
-            sum += g_project3_fc_in[i] * fc_weight[cls * 32 + i];
+        for (i = 0; i < PROJECT3_EMBEDDING_SIZE; i++) {
+            sum += g_project3_fc_in[i] *
+                   fc_weight[cls * PROJECT3_EMBEDDING_SIZE + i];
         }
         logits[cls] = sum;
+    }
+    if (speech_logit != NULL) {
+        float sum = speech_head_bias[0];
+        for (i = 0; i < PROJECT3_EMBEDDING_SIZE; i++) {
+            sum += g_project3_fc_in[i] * speech_head_weight[i];
+        }
+        *speech_logit = sum;
     }
     stage_end = _itoll(TSCH, TSCL);
     pool_fc_cycles = stage_end - stage_start;
@@ -3066,10 +3107,16 @@ static void Project3_ModelInit(PROJECT3_CONTEXT *ctx)
 static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const PROJECT3_UTTERANCE_BUFFER *utter)
 {
     PROJECT3_INFER_RESULT result;
+    float exp_value;
+    float speech_logit;
     unsigned long long stage_start;
     unsigned long long stage_end;
 
     ctx->model_state = PROJECT3_MODEL_READY;
+    g_project3_last_speech_logit = 0.0f;
+    g_project3_last_speech_probability = 0.0f;
+    g_project3_last_speech_gate_pass = 0u;
+    g_project3_last_raw_class_id = PROJECT3_CLASS_SILENCE;
     Project3_ResetMemoryGuard();
     Project3_LcdPauseForInference();
 
@@ -3079,7 +3126,9 @@ static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const 
         Project3_LcdResumeAfterInference();
         return result;
     }
-    Project3_BCResNetForward(g_project3_logmel, g_project3_logits);
+    Project3_BCResNetForward(g_project3_logmel, g_project3_logits,
+                             &speech_logit);
+    g_project3_last_speech_logit = speech_logit;
     if (!Project3_CheckMemoryGuard()) {
         result = Project3_MemoryFaultResult();
         Project3_LcdResumeAfterInference();
@@ -3087,6 +3136,32 @@ static PROJECT3_INFER_RESULT Project3_RunInference(PROJECT3_CONTEXT *ctx, const 
     }
     stage_start = _itoll(TSCH, TSCL);
     result = Project3_LogitsToResult(g_project3_logits);
+    g_project3_last_raw_class_id = result.class_id;
+    if (g_project3_last_speech_logit >= 0.0f) {
+        g_project3_last_speech_probability =
+            1.0f / (1.0f + expf(-g_project3_last_speech_logit));
+    } else {
+        exp_value = expf(g_project3_last_speech_logit);
+        g_project3_last_speech_probability =
+            exp_value / (1.0f + exp_value);
+    }
+    g_project3_last_speech_gate_pass =
+        (g_project3_last_speech_probability >=
+             PROJECT3_MODEL_SPEECH_LOW_THRESHOLD &&
+         (g_project3_last_speech_probability >=
+              PROJECT3_MODEL_SPEECH_HIGH_THRESHOLD ||
+          result.confidence >=
+              PROJECT3_MODEL_SPEECH_MIN_CONFIDENCE)) ? 1u : 0u;
+#if PROJECT3_ENABLE_MODEL_SPEECH_GATE
+    if (!g_project3_last_speech_gate_pass) {
+        result.second_class_id = result.class_id;
+        result.second_confidence = result.confidence;
+        result.class_id = PROJECT3_CLASS_SILENCE;
+        result.confidence = 1.0f - g_project3_last_speech_probability;
+        result.margin = result.confidence - result.second_confidence;
+        result.valid = 1u;
+    }
+#endif
     stage_end = _itoll(TSCH, TSCL);
     g_project3_profile_post_cycles = stage_end - stage_start;
     g_project3_profile_post_us =
